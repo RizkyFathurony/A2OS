@@ -237,8 +237,7 @@ static void show_help() {
     print("  diagnosis - membuka asisten diagnosis\n");
     print("  clear     - membersihkan layar\n");
     print("  echo      - menampilkan teks\n");
-    print("  shutdown  - mematikan A2OS (hanya di QEMU)\n");
-    print("  exit      - keluar dari A2OS dan QEMU\n\n");
+    print("  shutdown  - mematikan A2OS \n\n");
 }
 
 // Hanya bekerja jika QEMU dijalankan dengan perangkat isa-debug-exit.
@@ -261,72 +260,39 @@ static void show_diagnosis_result(int device, int category, int yes_count, bool 
         print("Perangkat : Laptop\n");
 
     if (category == 1) {
-        print("Kategori  : Baterai / daya\n");
+        print("Kategori  : Baterai / pengisian daya\n");
         if (answer_three) {
             print("Temuan    : Ada indikasi kondisi baterai tidak normal.\n");
             print("Saran     : Hentikan penggunaan jika baterai tampak membengkak atau terlalu panas.\n");
             print("            Minta teknisi memeriksa baterai dan rangkaian daya.\n");
         } else if (yes_count >= 2) {
-            print("Kemungkinan: Kapasitas baterai menurun atau konsumsi daya berlebih.\n");
-            print("Saran      : Periksa kesehatan baterai dan aplikasi yang banyak memakai daya.\n");
+            print("Kemungkinan: Baterai, kabel/adaptor, konektor, atau rangkaian charging bermasalah.\n");
+            print("Saran      : Uji aksesori pengisi daya yang sesuai dan periksa kesehatan baterai.\n");
         } else {
             print("Kemungkinan: Gangguan daya belum dapat dipastikan dari gejala ini.\n");
             print("Saran      : Periksa adaptor, konektor, dan kondisi baterai lebih lanjut.\n");
         }
     } else if (category == 2) {
-        print("Kategori  : Pengisian daya\n");
+        print("Kategori  : Layar / komponen input\n");
         if (yes_count >= 2) {
-            print("Kemungkinan: Kabel/adaptor, konektor, atau jalur pengisian bermasalah.\n");
-            print("Saran      : Uji dengan aksesori pengisi daya yang sesuai dan teruji.\n");
-            print("            Jika tetap gagal, periksa konektor dan rangkaian charging.\n");
+            print("Kemungkinan: Layar, komponen input, kabel fleksibel, atau driver bermasalah.\n");
+            print("Saran      : Periksa kondisi layar dan uji fungsi sentuh/keyboard/touchpad.\n");
         } else {
-            print("Kemungkinan: Gangguan pengisian belum terlihat jelas.\n");
-            print("Saran      : Amati apakah pengisian terputus-putus dan periksa aksesori.\n");
-        }
-    } else if (category == 3) {
-        print("Kategori  : Layar / tampilan\n");
-        if (yes_count >= 2) {
-            print("Kemungkinan: Panel layar, kabel fleksibel, atau pengaturan tampilan bermasalah.\n");
-            print("Saran      : Periksa kondisi fisik layar dan lakukan pemeriksaan komponen.\n");
-        } else {
-            print("Kemungkinan: Gangguan tampilan mungkin terkait perangkat lunak atau koneksi layar.\n");
-            print("Saran      : Coba mulai ulang perangkat dan amati apakah gejala berulang.\n");
-        }
-    } else if (category == 4) {
-        print("Kategori  : Performa lambat\n");
-        if (yes_count >= 2) {
-            print("Kemungkinan: Beban aplikasi tinggi, penyimpanan hampir penuh, atau sistem bermasalah.\n");
-            print("Saran      : Periksa ruang penyimpanan, aplikasi berjalan, dan pembaruan sistem.\n");
-        } else {
-            print("Kemungkinan: Perlambatan belum menunjukkan satu penyebab yang jelas.\n");
-            print("Saran      : Pantau aplikasi yang berjalan dan mulai ulang perangkat.\n");
-        }
-    } else if (category == 5) {
-        if (device == 1)
-            print("Kategori  : Layar sentuh\n");
-        else
-            print("Kategori  : Keyboard / touchpad\n");
-
-        if (yes_count >= 2) {
-            print("Kemungkinan: Komponen input atau driver/perangkat lunak mengalami gangguan.\n");
-            print("Saran      : Periksa pengaturan/driver dan lakukan pengujian komponen.\n");
-        } else {
-            print("Kemungkinan: Gangguan input belum dapat dipastikan.\n");
-            print("Saran      : Mulai ulang perangkat dan uji kembali fungsi input.\n");
+            print("Kemungkinan: Gangguan layar atau komponen input belum dapat dipastikan.\n");
+            print("Saran      : Mulai ulang perangkat dan lakukan pengujian komponen.\n");
         }
     } else {
-        print("Kategori  : Sistem operasi / booting\n");
+        print("Kategori  : Performa / sistem operasi\n");
         if (yes_count >= 2) {
-            print("Kemungkinan: Sistem operasi, file sistem, atau proses boot mengalami gangguan.\n");
-            print("Saran      : Catat pesan error dan lakukan pemeriksaan sistem terlebih dahulu.\n");
+            print("Kemungkinan: Beban aplikasi tinggi, penyimpanan penuh, atau sistem operasi bermasalah.\n");
+            print("Saran      : Periksa ruang penyimpanan, aplikasi berjalan, dan pesan error sistem.\n");
         } else {
-            print("Kemungkinan: Gangguan sistem belum menunjukkan penyebab yang pasti.\n");
-            print("Saran      : Periksa pesan error dan perubahan terakhir pada perangkat.\n");
+            print("Kemungkinan: Gangguan performa atau sistem belum menunjukkan penyebab pasti.\n");
+            print("Saran      : Mulai ulang perangkat dan amati apakah masalah muncul kembali.\n");
         }
     }
 
-    print("-----------------------------------------\n");
-    print("Analisis awal berdasarkan jawaban pelanggan,\n\n");
+    print("-----------------------------------------\n\n");
 }
 
 static void run_diagnosis() {
@@ -342,40 +308,34 @@ static void run_diagnosis() {
     print("  2. Laptop\n");
     print("  0. Kembali\n\n");
 
-    while (device < 0 || device > 2) {
+    // Gunakan do-while agar input pertama benar-benar dibaca.
+    do {
         device = read_number("Pilihan: ");
         if (device < 0 || device > 2)
             print("Pilihan tidak valid. Masukkan 0, 1, atau 2.\n");
-    }
+    } while (device < 0 || device > 2);
 
     if (device == 0)
         return;
 
     clear_screen();
     print("PILIH KATEGORI MASALAH\n\n");
-    print("  1. Baterai / perangkat cepat mati\n");
-    print("  2. Pengisian daya / tidak bisa charging\n");
-    print("  3. Layar / tampilan\n");
-    print("  4. Performa lambat\n");
-    if (device == 1)
-        print("  5. Layar sentuh tidak responsif\n");
-    else
-        print("  5. Keyboard / touchpad bermasalah\n");
-    print("  6. Sistem operasi / gagal booting\n");
+    print("  1. Baterai / pengisian daya bermasalah\n");
+    print("  2. Layar / komponen input bermasalah\n");
+    print("  3. Performa lambat / sistem operasi bermasalah\n");
     print("  0. Kembali\n\n");
 
-    while (category < 0 || category > 6) {
+    do {
         category = read_number("Kategori: ");
-        if (category < 0 || category > 6)
-            print("Pilihan tidak valid. Masukkan angka 0 sampai 6.\n");
-    }
+        if (category < 0 || category > 3)
+            print("Pilihan tidak valid. Masukkan angka 0 sampai 3.\n");
+    } while (category < 0 || category > 3);
 
     if (category == 0)
         return;
 
     clear_screen();
     print("PERTANYAAN DIAGNOSIS\n");
-    print("Jawab berdasarkan keterangan pelanggan.\n\n");
 
     int yes_count = 0;
     bool answer_three = false;
@@ -383,53 +343,30 @@ static void run_diagnosis() {
     if (category == 1) {
         if (ask_yes_no("1. Apakah baterai cepat habis atau perangkat sering mati?"))
             ++yes_count;
-        if (ask_yes_no("2. Apakah persentase baterai berubah tidak wajar?"))
+        if (ask_yes_no("2. Apakah perangkat sulit mengisi daya atau pengisian sering terputus?"))
             ++yes_count;
         answer_three = ask_yes_no("3. Apakah baterai terlihat membengkak atau terasa sangat panas?");
         if (answer_three) ++yes_count;
     } else if (category == 2) {
-        if (ask_yes_no("1. Apakah perangkat tidak mengisi daya dengan aksesori yang biasa dipakai?"))
+        if (ask_yes_no("1. Apakah layar bermasalah (gelap, bergaris, berkedip, atau berubah warna)?"))
             ++yes_count;
-        if (ask_yes_no("2. Apakah pengisian sering tersambung dan terputus?"))
-            ++yes_count;
-        if (ask_yes_no("3. Apakah perangkat tetap tidak mengisi dengan kabel/adaptor lain yang sesuai?"))
-            ++yes_count;
-    } else if (category == 3) {
-        if (ask_yes_no("1. Apakah layar gelap atau tidak menampilkan gambar dengan normal?"))
-            ++yes_count;
-        if (ask_yes_no("2. Apakah muncul garis, kedipan, atau perubahan warna?"))
-            ++yes_count;
-        if (ask_yes_no("3. Apakah masalah tetap muncul setelah perangkat dimulai ulang?"))
-            ++yes_count;
-    } else if (category == 4) {
-        if (ask_yes_no("1. Apakah perangkat terasa lambat saat membuka aplikasi?"))
-            ++yes_count;
-        if (ask_yes_no("2. Apakah ruang penyimpanan hampir penuh?"))
-            ++yes_count;
-        if (ask_yes_no("3. Apakah perangkat tetap lambat setelah dimulai ulang?"))
-            ++yes_count;
-    } else if (category == 5) {
+
         if (device == 1) {
-            if (ask_yes_no("1. Apakah sebagian area layar sentuh tidak merespons?"))
-                ++yes_count;
-            if (ask_yes_no("2. Apakah layar sentuh bergerak atau memilih menu sendiri?"))
-                ++yes_count;
-            if (ask_yes_no("3. Apakah masalah tetap terjadi setelah layar dibersihkan dan perangkat dimulai ulang?"))
+            if (ask_yes_no("2. Apakah layar sentuh tidak merespons atau bergerak sendiri?"))
                 ++yes_count;
         } else {
-            if (ask_yes_no("1. Apakah beberapa tombol keyboard atau touchpad tidak berfungsi?"))
-                ++yes_count;
-            if (ask_yes_no("2. Apakah masalah terjadi juga pada perangkat input lain?"))
-                ++yes_count;
-            if (ask_yes_no("3. Apakah masalah tetap terjadi setelah laptop dimulai ulang?"))
+            if (ask_yes_no("2. Apakah keyboard atau touchpad tidak merespons dengan normal?"))
                 ++yes_count;
         }
+
+        if (ask_yes_no("3. Apakah masalah tetap terjadi setelah perangkat dimulai ulang?"))
+            ++yes_count;
     } else {
-        if (ask_yes_no("1. Apakah perangkat gagal masuk ke sistem operasi?"))
+        if (ask_yes_no("1. Apakah perangkat terasa lambat saat digunakan atau membuka aplikasi?"))
             ++yes_count;
-        if (ask_yes_no("2. Apakah muncul pesan error atau proses boot berhenti?"))
+        if (ask_yes_no("2. Apakah perangkat gagal masuk ke sistem operasi atau menampilkan pesan error?"))
             ++yes_count;
-        if (ask_yes_no("3. Apakah masalah mulai muncul setelah update atau perubahan sistem?"))
+        if (ask_yes_no("3. Apakah ruang penyimpanan hampir penuh atau masalah muncul setelah update?"))
             ++yes_count;
     }
 
