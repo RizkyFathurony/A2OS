@@ -42,3 +42,12 @@ terfokus. Keluar dari QEMU dengan `Ctrl+Alt+G` atau tutup jendelanya.
 - Kernel berjalan dalam mode x86 32-bit dan memakai VGA text mode serta polling
   keyboard PS/2 untuk tahap awal.
 - Jangan menganggap pesan boot sebagai bukti fitur yang belum diimplementasikan.
+
+## Demo penjadwalan & sinkronisasi (shell: menu 2 "Terminal A2OS")
+
+- `sched`: 3 tugas (A, B, C) dijadwalkan Round Robin secara preemptive.
+- `race`: dua tugas menambah counter bersama tanpa kunci (hasil salah, race condition).
+- `race lock`: sama, tetapi dilindungi mutex (hasil benar).
+- `prodcons`: produsen-konsumen dengan semaphore dan buffer 3 slot.
+
+Berkas terkait: `boot/isr.asm` (context switch), `kernel/scheduler.cpp` (IDT, PIC, PIT, Round Robin), `kernel/sync.cpp` (mutex, semaphore).

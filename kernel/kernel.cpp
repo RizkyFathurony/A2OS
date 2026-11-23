@@ -1,6 +1,4 @@
-using u8  = unsigned char;
-using u16 = unsigned short;
-using u32 = unsigned int;
+#include "scheduler.h"
 
 static volatile u16* const VGA = reinterpret_cast<volatile u16*>(0xB8000);
 static const u8 COLOR = 0x0F;
@@ -94,9 +92,14 @@ static void put_char(char c) {
     update_cursor();
 }
 
+// Mutex konsol: mencegah keluaran beberapa tugas saling tercampur di layar VGA.
+static Mutex console_lock = {0, -1};
+
 static void print(const char* s) {
+    mutex_lock(&console_lock);
     while (*s)
         put_char(*s++);
+    mutex_unlock(&console_lock);
 }
 
 static bool equals(const char* a, const char* b) {
@@ -235,6 +238,10 @@ static void show_help() {
     print("  help      - menampilkan daftar perintah\n");
     print("  about     - informasi tentang A2OS\n");
     print("  diagnosis - membuka asisten diagnosis\n");
+    print("  sched     - demo penjadwalan Round Robin preemptive\n");
+    print("  race      - demo race condition (tanpa kunci)\n");
+    print("  race lock - demo sinkronisasi dengan mutex\n");
+    print("  prodcons  - demo semaphore (produsen-konsumen)\n");
     print("  clear     - membersihkan layar\n");
     print("  echo      - menampilkan teks\n");
     print("  shutdown  - mematikan A2OS \n\n");
@@ -382,6 +389,196 @@ static void show_about() {
     print("untuk membantu teknisi mengelompokkan keluhan HP dan laptop.\n");
 }
 
+
+// ======================================================================
+// Demo penjadwalan CPU preemptive dan sinkronisasi (Nama 2)
+// ======================================================================
+static void u32_to_str(u32 v, char* out) {
+    char tmp[12];
+    int n = 0;
+    if (v == 0) tmp[n++] = '0';
+    while (v > 0) { tmp[n++] = static_cast<char>('0' + v % 10); v /= 10; }
+    int i = 0;
+    while (n > 0) out[i++] = tmp[--n];
+    out[i] = '\0';
+}
+
+static void append(char* dst, const char* src) {
+    while (*dst) ++dst;
+    while (*src) *dst++ = *src++;
+    *dst = '\0';
+}
+
+static void print_uint(u32 v) {
+    char buf[12];
+    u32_to_str(v, buf);
+    print(buf);
+}
+
+// Menunggu n tick berdasarkan jam timer (bukan waktu CPU), jadi tugas pasti
+// terpotong oleh preemption selama menunggu.
+static void busy_wait_ticks(u32 n) {
+    u32 start = sched_ticks();
+    while (sched_ticks() - start < n) { }
+}
+
+static void wait_all_tasks() {
+    while (!sched_all_done(1))
+        task_yield();
+}
+
+// ---- Demo 1: Round Robin ----
+static void rr_body(const char* tag) {
+    for (u32 i = 1; i <= 5; ++i) {
+        busy_wait_ticks(20);                       // 200 ms > quantum 50 ms -> pasti di-preempt
+        char line[64];
+        char num[12];
+        line[0] = '\0';
+        append(line, "  [Tugas ");
+        append(line, tag);
+        append(line, "] iterasi ");
+        u32_to_str(i, num);    append(line, num);
+        append(line, " pada tick ");
+        u32_to_str(sched_ticks(), num);  append(line, num);
+        append(line, "\n");
+        print(line);                               // print() sudah dilindungi console_lock
+    }
+}
+static void rr_task_a() { rr_body("A"); }
+static void rr_task_b() { rr_body("B"); }
+static void rr_task_c() { rr_body("C"); }
+
+static const char* state_name(int s) {
+    switch (s) {
+        case TASK_READY:   return "READY  ";
+        case TASK_RUNNING: return "RUNNING";
+        case TASK_BLOCKED: return "BLOCKED";
+        case TASK_DEAD:    return "SELESAI";
+        default:           return "-      ";
+    }
+}
+
+static void demo_sched() {
+    print("Round Robin: quantum = 5 tick (50 ms), timer 100 Hz.\n");
+    print("Membuat 3 tugas A, B, C...\n");
+    task_create("A", rr_task_a);
+    task_create("B", rr_task_b);
+    task_create("C", rr_task_c);
+    wait_all_tasks();
+
+    print("\n  Tugas   Status   CPU(tick)  Dijadwalkan\n");
+    for (int id = 0; id < MAX_TASKS; ++id) {
+        TaskInfo ti;
+        if (!task_get_info(id, &ti)) continue;
+        char row[64];
+        char num[12];
+        row[0] = '\0';
+        append(row, "  ");
+        append(row, ti.name);
+        int len = 0; while (row[len]) ++len;
+        while (len < 10) { row[len++] = ' '; row[len] = '\0'; }   // kolom nama selebar 8
+        append(row, state_name(ti.state));
+        append(row, "  ");
+        u32_to_str(ti.cpu_ticks, num); append(row, num);
+        int len2 = 0; while (row[len2]) ++len2;
+        while (len2 < 33) { row[len2++] = ' '; row[len2] = '\0'; }
+        u32_to_str(ti.switches, num);  append(row, num);
+        append(row, "\n");
+        print(row);
+    }
+    print("\n");
+}
+
+// ---- Demo 2: race condition vs mutex ----
+static volatile int shared_counter = 0;
+static Mutex race_lock = {0, -1};
+static bool race_use_lock = false;
+static const int RACE_LOOPS = 300;
+
+static void race_body() {
+    for (int i = 0; i < RACE_LOOPS; ++i) {
+        if (race_use_lock) mutex_lock(&race_lock);
+        int tmp = shared_counter;                  // read
+        for (volatile int k = 0; k < 200000; ++k) { }   // "pekerjaan" -> peluang di-preempt
+        shared_counter = tmp + 1;                  // modify-write
+        if (race_use_lock) mutex_unlock(&race_lock);
+    }
+}
+static void race_task_1() { race_body(); }
+static void race_task_2() { race_body(); }
+
+static void demo_race(bool use_lock) {
+    shared_counter = 0;
+    race_use_lock = use_lock;
+    print(use_lock ? "Mode: DENGAN mutex.\n" : "Mode: TANPA kunci.\n");
+    print("2 tugas masing-masing menambah counter 300 kali. Harapan: 600.\n");
+    print("Menjalankan... (tunggu beberapa detik)\n");
+    task_create("R1", race_task_1);
+    task_create("R2", race_task_2);
+    wait_all_tasks();
+    print("Hasil counter = ");
+    print_uint(static_cast<u32>(shared_counter));
+    if (shared_counter == 2 * RACE_LOOPS)
+        print("  -> BENAR (tidak ada update yang hilang)\n\n");
+    else
+        print("  -> SALAH (terjadi race condition, update hilang)\n\n");
+}
+
+// ---- Demo 3: semaphore, produsen-konsumen dengan buffer 3 slot ----
+static int pc_buf[3];
+static int pc_in = 0, pc_out = 0;
+static Semaphore pc_empty, pc_full;
+static Mutex pc_lock = {0, -1};
+
+static void pc_say(const char* who, int item) {
+    char line[48];
+    char num[12];
+    line[0] = '\0';
+    append(line, "  ");
+    append(line, who);
+    u32_to_str(static_cast<u32>(item), num);
+    append(line, num);
+    append(line, "\n");
+    print(line);
+}
+
+static void producer_task() {
+    for (int item = 1; item <= 8; ++item) {
+        sem_wait(&pc_empty);                       // tunggu slot kosong
+        mutex_lock(&pc_lock);
+        pc_buf[pc_in] = item;
+        pc_in = (pc_in + 1) % 3;
+        mutex_unlock(&pc_lock);
+        sem_post(&pc_full);
+        pc_say("Produsen membuat item ", item);
+        busy_wait_ticks(5);
+    }
+}
+
+static void consumer_task() {
+    for (int n = 0; n < 8; ++n) {
+        sem_wait(&pc_full);                        // tunggu ada item
+        mutex_lock(&pc_lock);
+        int item = pc_buf[pc_out];
+        pc_out = (pc_out + 1) % 3;
+        mutex_unlock(&pc_lock);
+        sem_post(&pc_empty);
+        pc_say("                 Konsumen mengambil item ", item);
+        busy_wait_ticks(20);                       // konsumen lebih lambat -> produsen sempat diblok
+    }
+}
+
+static void demo_prodcons() {
+    pc_in = pc_out = 0;
+    sem_init(&pc_empty, 3);
+    sem_init(&pc_full, 0);
+    print("Produsen cepat, konsumen lambat, buffer 3 slot (semaphore).\n");
+    task_create("prod", producer_task);
+    task_create("cons", consumer_task);
+    wait_all_tasks();
+    print("Selesai.\n\n");
+}
+
 static void shell() {
     char input[128];
 
@@ -398,6 +595,14 @@ static void shell() {
             show_about();
         } else if (equals(input, "diagnosis")) {
             run_diagnosis();
+        } else if (equals(input, "sched")) {
+            demo_sched();
+        } else if (equals(input, "race")) {
+            demo_race(false);
+        } else if (equals(input, "race lock")) {
+            demo_race(true);
+        } else if (equals(input, "prodcons")) {
+            demo_prodcons();
         } else if (equals(input, "clear")) {
             clear_screen();
             print_logo();
@@ -459,7 +664,10 @@ extern "C" void kernel_main() {
     print_logo();
     print("[ OK ] Kernel A2OS berhasil dimuat.\n");
     print("[ OK ] Shell internal siap digunakan.\n");
-    print("[ OK ] Asisten diagnosis siap digunakan.\n\n");
+    print("[ OK ] Asisten diagnosis siap digunakan.\n");
+
+    sched_init();
+    print("[ OK ] Penjadwal Round Robin preemptive aktif (timer 100 Hz).\n\n");
 
     main_menu();
 
