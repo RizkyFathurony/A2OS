@@ -20,11 +20,17 @@ $(BUILD_DIR):
 $(BUILD_DIR)/boot.o: boot/boot.asm | $(BUILD_DIR)
 	$(AS) -f elf32 $< -o $@
 
-$(BUILD_DIR)/kernel.o: kernel/kernel.cpp | $(BUILD_DIR)
+$(BUILD_DIR)/isr.o: boot/isr.asm | $(BUILD_DIR)
+	$(AS) -f elf32 $< -o $@
+
+$(BUILD_DIR)/%.o: kernel/%.cpp kernel/scheduler.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/kernel.elf: $(BUILD_DIR)/boot.o $(BUILD_DIR)/kernel.o linker.ld
-	$(LD) $(LDFLAGS) -o $@ $(BUILD_DIR)/boot.o $(BUILD_DIR)/kernel.o
+OBJS := $(BUILD_DIR)/boot.o $(BUILD_DIR)/isr.o $(BUILD_DIR)/kernel.o \
+        $(BUILD_DIR)/scheduler.o $(BUILD_DIR)/sync.o
+
+$(BUILD_DIR)/kernel.elf: $(OBJS) linker.ld
+	$(LD) $(LDFLAGS) -o $@ $(OBJS)
 
 $(BUILD_DIR)/a2os.iso: $(BUILD_DIR)/kernel.elf grub/grub.cfg
 	mkdir -p $(ISO_DIR)/boot/grub
