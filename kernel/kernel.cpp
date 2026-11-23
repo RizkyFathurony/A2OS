@@ -8,8 +8,25 @@ static int cursor_x = 0;
 static int cursor_y = 0;
 
 // Status keyboard dibuat global agar tetap konsisten di shell dan menu diagnosis.
-static bool shift_down = false;
+static bool shift_down   = false;
 static bool caps_lock = false;
+
+
+// Hak akses sederhana: Admin memiliki akses penuh, User hanya mengelola
+// berkas yang dibuat oleh akunnya sendiri.
+static bool current_is_admin = false;
+static const int MAX_FILES = 8;
+static const int FILE_NAME_SIZE = 24;
+static const int FILE_CONTENT_SIZE = 160;
+
+struct RamFile {
+    bool used;
+    bool owner_is_admin;
+    char name[FILE_NAME_SIZE];
+    char content[FILE_CONTENT_SIZE];
+};
+
+static RamFile ram_files[MAX_FILES];
 
 static inline u8 inb(u16 port) {
     u8 value;
@@ -223,11 +240,225 @@ static int read_number(const char* prompt) {
 static bool ask_yes_no(const char* question) {
     char answer[8];
 
-    print(question);
-    print(" (y/n): ");
-    read_line(answer, 8);
+    while (true) {
+        print(question);
+        print(" (y/n atau yes/no): ");
+        read_line(answer, 8);
 
-    return answer[0] == 'y' || answer[0] == 'Y';
+        if ((answer[0] == 'y' || answer[0] == 'Y') && answer[1] == '\0')
+            return true;
+
+        if ((answer[0] == 'y' || answer[0] == 'Y') &&
+            (answer[1] == 'e' || answer[1] == 'E') &&
+            (answer[2] == 's' || answer[2] == 'S') &&
+            answer[3] == '\0')
+            return true;
+
+        if ((answer[0] == 'n' || answer[0] == 'N') && answer[1] == '\0')
+            return false;
+
+        if ((answer[0] == 'n' || answer[0] == 'N') &&
+            (answer[1] == 'o' || answer[1] == 'O') &&
+            answer[2] == '\0')
+            return false;
+
+        print("Input tidak valid. Masukkan y, yes, n, atau no.\n");
+    }
+}
+
+// ---------- VFS RAMDisk sederhana ----------
+
+static void copy_string(char* destination, const char* source, int max_size) {
+    int i = 0;
+    while (source[i] && i < max_size - 1) {
+        destination[i] = source[i];
+        ++i;
+    }
+    destination[i] = '\0';
+}
+
+static int find_file(const char* name) {
+    for (int i = 0; i < MAX_FILES; ++i) {
+        if (ram_files[i].used && equals(ram_files[i].name, name))
+            return i;
+    }
+    return -1;
+}
+
+static bool can_access_file(int index) {
+    if (index < 0 || index >= MAX_FILES || !ram_files[index].used)
+        return false;
+
+    return current_is_admin ||
+           ram_files[index].owner_is_admin == current_is_admin;
+}
+
+static void vfs_list() {
+    bool found = false;
+    print("Daftar berkas:\n");
+
+    for (int i = 0; i < MAX_FILES; ++i) {
+        if (!ram_files[i].used)
+            continue;
+
+        if (!current_is_admin && ram_files[i].owner_is_admin)
+            continue;
+
+        print("  ");
+        print(ram_files[i].name);
+        print(ram_files[i].owner_is_admin ? " [ADMIN]\n" : " [USER]\n");
+        found = true;
+    }
+
+    if (!found)
+        print("  Belum ada berkas yang dapat ditampilkan.\n");
+    print("\n");
+}
+
+static void vfs_create() {
+    char name[FILE_NAME_SIZE];
+    char content[FILE_CONTENT_SIZE];
+
+    print("Nama file (tanpa spasi): ");
+    read_line(name, FILE_NAME_SIZE);
+
+    if (name[0] == '\0') {
+        print("Nama file tidak boleh kosong.\n\n");
+        return;
+    }
+
+    if (find_file(name) >= 0) {
+        print("Nama file sudah digunakan.\n\n");
+        return;
+    }
+
+    int slot = -1;
+    for (int i = 0; i < MAX_FILES; ++i) {
+        if (!ram_files[i].used) {
+            slot = i;
+            break;
+        }
+    }
+
+    if (slot < 0) {
+        print("RAMDisk penuh. Hapus berkas yang tidak diperlukan.\n\n");
+        return;
+    }
+
+    print("Isi file: ");
+    read_line(content, FILE_CONTENT_SIZE);
+
+    ram_files[slot].used = true;
+    ram_files[slot].owner_is_admin = current_is_admin;
+    copy_string(ram_files[slot].name, name, FILE_NAME_SIZE);
+    copy_string(ram_files[slot].content, content, FILE_CONTENT_SIZE);
+
+    print("File berhasil dibuat.\n\n");
+}
+
+static void vfs_read() {
+    char name[FILE_NAME_SIZE];
+    print("Nama file: ");
+    read_line(name, FILE_NAME_SIZE);
+
+    int index = find_file(name);
+    if (index < 0) {
+        print("File tidak ditemukan.\n\n");
+        return;
+    }
+
+    if (!can_access_file(index)) {
+        print("Akses ditolak. File ini milik Admin.\n\n");
+        return;
+    }
+
+    print("Isi ");
+    print(ram_files[index].name);
+    print(":\n");
+    print(ram_files[index].content);
+    print("\n\n");
+}
+
+static void vfs_write() {
+    char name[FILE_NAME_SIZE];
+    char content[FILE_CONTENT_SIZE];
+
+    print("Nama file: ");
+    read_line(name, FILE_NAME_SIZE);
+
+    int index = find_file(name);
+    if (index < 0) {
+        print("File tidak ditemukan.\n\n");
+        return;
+    }
+
+    if (!can_access_file(index)) {
+        print("Akses ditolak. Anda bukan pemilik file.\n\n");
+        return;
+    }
+
+    print("Isi baru: ");
+    read_line(content, FILE_CONTENT_SIZE);
+    copy_string(ram_files[index].content, content, FILE_CONTENT_SIZE);
+    print("File berhasil diperbarui.\n\n");
+}
+
+static void vfs_delete() {
+    char name[FILE_NAME_SIZE];
+    print("Nama file: ");
+    read_line(name, FILE_NAME_SIZE);
+
+    int index = find_file(name);
+    if (index < 0) {
+        print("File tidak ditemukan.\n\n");
+        return;
+    }
+
+    if (!can_access_file(index)) {
+        print("Akses ditolak. Anda bukan pemilik file.\n\n");
+        return;
+    }
+
+    ram_files[index].used = false;
+    ram_files[index].name[0] = '\0';
+    ram_files[index].content[0] = '\0';
+    print("File berhasil dihapus.\n\n");
+}
+
+static bool login() {
+    char username[24];
+    char password[24];
+
+    while (true) {
+        clear_screen();
+        print_logo();
+        print("          A2OS LOGIN\n\n");
+        print("Akun demo:\n");
+        print("  Admin : admin / admin123\n");
+        print("  User  : user  / user123\n\n");
+
+        print("Username: ");
+        read_line(username, 24);
+        print("Password: ");
+        read_line(password, 24);
+
+        if (equals(username, "admin") && equals(password, "admin123")) {
+            current_is_admin = true;
+            print("Login sebagai Admin berhasil.\n");
+            return true;
+        }
+
+        if (equals(username, "user") && equals(password, "user123")) {
+            current_is_admin = false;
+            print("Login sebagai User berhasil.\n");
+            return true;
+        }
+
+        print("Username atau password salah.\n");
+        print("Tekan Enter untuk mencoba lagi...");
+        char wait[4];
+        read_line(wait, 4);
+    }
 }
 
 static void show_help() {
@@ -237,6 +468,13 @@ static void show_help() {
     print("  diagnosis - membuka asisten diagnosis\n");
     print("  clear     - membersihkan layar\n");
     print("  echo      - menampilkan teks\n");
+    print("  ls        - melihat daftar file RAMDisk\n");
+    print("  create    - membuat file teks\n");
+    print("  cat       - membaca isi file\n");
+    print("  write     - mengubah isi file\n");
+    print("  rm        - menghapus file\n");
+    print("  whoami    - melihat akun aktif\n");
+    print("  logout    - keluar dari akun\n");
     print("  shutdown  - mematikan A2OS \n\n");
 }
 
@@ -389,7 +627,7 @@ static void shell() {
     print("Ketik 'help' untuk melihat daftar perintah.\n\n");
 
     while (true) {
-        print("A2OS> ");
+        print(current_is_admin ? "A2OS[ADMIN]> " : "A2OS[USER]> ");
         read_line(input, 128);
 
         if (equals(input, "help")) {
@@ -398,6 +636,23 @@ static void shell() {
             show_about();
         } else if (equals(input, "diagnosis")) {
             run_diagnosis();
+        } else if (equals(input, "ls")) {
+            vfs_list();
+        } else if (equals(input, "create")) {
+            vfs_create();
+        } else if (equals(input, "cat")) {
+            vfs_read();
+        } else if (equals(input, "write")) {
+            vfs_write();
+        } else if (equals(input, "rm")) {
+            vfs_delete();
+        } else if (equals(input, "whoami")) {
+            print(current_is_admin ? "Akun aktif: ADMIN\\n\\n" : "Akun aktif: USER\\n\\n");
+        } else if (equals(input, "logout")) {
+            login();
+            clear_screen();
+            print_logo();
+            print("Ketik 'help' untuk melihat perintah.\\n\\n");
         } else if (equals(input, "clear")) {
             clear_screen();
             print_logo();
@@ -456,11 +711,9 @@ extern "C" void kernel_main() {
     clear_screen();
     enable_cursor();
 
-    print_logo();
-    print("[ OK ] Kernel A2OS berhasil dimuat.\n");
-    print("[ OK ] Shell internal siap digunakan.\n");
-    print("[ OK ] Asisten diagnosis siap digunakan.\n\n");
-
+    // Login ditampilkan pertama kali setelah kernel siap.
+    // Menu utama baru dibuka setelah username dan password valid.
+    login();
     main_menu();
 
     for (;;)
