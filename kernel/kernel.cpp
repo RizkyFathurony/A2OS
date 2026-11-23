@@ -908,11 +908,9 @@ extern "C" void kernel_main() {
     clear_screen();
     enable_cursor();
 
-    print_logo();
-    print("[ OK ] Kernel A2OS berhasil dimuat.\n");
-    print("[ OK ] Shell internal siap digunakan.\n");
-    print("[ OK ] Asisten diagnosis siap digunakan.\n\n");
-
+    // Login ditampilkan pertama kali setelah kernel siap.
+    // Menu utama baru dibuka setelah username dan password valid.
+    login();
     main_menu();
 
     for (;;)
