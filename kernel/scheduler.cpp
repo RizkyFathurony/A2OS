@@ -62,6 +62,7 @@ struct Task {
     int         state;
     const char* name;
     const void* waiting;      // objek sinkronisasi yang ditunggu (jika BLOCKED)
+    int         held_locks;   // jumlah mutex yang sedang dipegang tugas ini
     u32         cpu_ticks;
     u32         switches;
 };
@@ -155,6 +156,7 @@ int task_create(const char* name, void (*entry)()) {
     tasks[id].state     = TASK_READY;
     tasks[id].name      = name;
     tasks[id].waiting   = nullptr;
+    tasks[id].held_locks = 0;
     tasks[id].cpu_ticks = 0;
     tasks[id].switches  = 0;
 
@@ -198,6 +200,35 @@ void task_wake_all(const void* obj) {
             tasks[i].waiting = nullptr;
         }
     }
+}
+
+void task_lock_delta(int delta) {
+    tasks[current].held_locks += delta;
+    if (tasks[current].held_locks < 0) tasks[current].held_locks = 0;
+}
+
+int task_kill(int id) {
+    u32 f = irq_save();
+    int result;
+
+    if (id == 0) {
+        result = KILL_MAIN;
+    } else if (id < 0 || id >= MAX_TASKS ||
+               tasks[id].state == TASK_FREE || tasks[id].state == TASK_DEAD) {
+        result = KILL_INVALID;
+    } else if (id == current) {
+        result = KILL_SELF;
+    } else if (tasks[id].held_locks > 0) {
+        result = KILL_HOLDS_LOCK;
+    } else {
+        // Tugas ditandai DEAD: tidak akan dijadwalkan lagi dan slotnya bisa dipakai ulang.
+        tasks[id].state   = TASK_DEAD;
+        tasks[id].waiting = nullptr;
+        result = KILL_OK;
+    }
+
+    irq_restore(f);
+    return result;
 }
 
 void sched_init() {
