@@ -36,12 +36,24 @@ terfokus. Keluar dari QEMU dengan `Ctrl+Alt+G` atau tutup jendelanya.
 
 ## Catatan
 
-- Ini adalah prototype awal untuk memenuhi demonstrasi boot, logo ASCII, dan
-  shell internal; belum mengimplementasikan scheduler, mutex, allocator,
-  filesystem, atau proteksi akses.
+- Sudah ada: boot GRUB Multiboot, login, asisten diagnosis, penjadwal Round Robin
+  preemptive, mutex, semaphore, dan RAMDisk sederhana dengan hak akses Admin/User.
+- Belum ada: alokator memori dinamis dan deteksi deadlock.
 - Kernel berjalan dalam mode x86 32-bit dan memakai VGA text mode serta polling
-  keyboard PS/2 untuk tahap awal.
+  keyboard PS/2 (hanya IRQ0 timer yang aktif untuk penjadwal).
 - Jangan menganggap pesan boot sebagai bukti fitur yang belum diimplementasikan.
+
+## Pengelolaan thread (shell: menu 2 "Terminal A2OS")
+
+- `threads` (alias `ps`): tabel semua thread: id, nama, status (RUNNING / READY /
+  BLOCKED / SELESAI), CPU (tick dan persen), dan berapa kali dijadwalkan. Id 0 = `main` (shell).
+- `spawn`: membuat thread `worker` yang aktif sekitar 10 detik. Jalankan `spawn`
+  beberapa kali lalu `threads` untuk melihat thread bergantian memakai CPU.
+  Maksimal 6 slot thread, termasuk `main`.
+- `kill <id>`: menghentikan thread. Ditolak untuk `main` (id 0), thread yang sedang
+  berjalan, dan thread yang sedang memegang mutex (supaya mutex tidak terkunci selamanya).
+  Thread yang menunggu semaphore boleh dihentikan, tetapi hitungan semaphore tidak dipulihkan.
+- `menu`: kembali ke menu utama.
 
 ## Demo penjadwalan & sinkronisasi (shell: menu 2 "Terminal A2OS")
 

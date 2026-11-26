@@ -27,6 +27,11 @@ u32  sched_ticks();                                 // jumlah tick sejak boot
 bool task_get_info(int id, TaskInfo* out);
 bool sched_all_done(int first_id);                  // semua tugas id >= first_id sudah selesai?
 
+// Hentikan paksa sebuah thread. Ditolak jika thread itu main (id 0), thread yang sedang
+// berjalan, atau thread yang sedang memegang mutex (agar mutex tidak terkunci selamanya).
+enum KillResult : int { KILL_OK = 0, KILL_INVALID, KILL_MAIN, KILL_SELF, KILL_HOLDS_LOCK };
+int  task_kill(int id);
+
 // ---------- Sinkronisasi ----------
 u32  irq_save();                 // matikan interrupt, kembalikan EFLAGS lama
 void irq_restore(u32 flags);
@@ -43,5 +48,6 @@ void sem_wait(Semaphore* s);     // P / down: blok jika count == 0
 void sem_post(Semaphore* s);     // V / up
 
 // Dipakai internal oleh sync.cpp
+void task_lock_delta(int delta);       // catat mutex dipegang (+1) / dilepas (-1) oleh tugas sekarang (IF=0)
 void task_block_on(const void* obj);   // tandai tugas sekarang BLOCKED menunggu obj (panggil saat IF=0)
 void task_wake_all(const void* obj);   // bangunkan semua tugas yang menunggu obj (panggil saat IF=0)

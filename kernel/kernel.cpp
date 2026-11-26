@@ -43,11 +43,14 @@ static inline void outl(u16 port, u32 value) {
 // Perbarui posisi hardware cursor VGA (mode teks 80x25).
 static void update_cursor() {
     if (cursor_x < 0) cursor_x = 0;
-    if (cursor_x > 79) cursor_x = 79;
     if (cursor_y < 0) cursor_y = 0;
-    if (cursor_y > 24) cursor_y = 24;
 
-    u16 position = static_cast<u16>(cursor_y * 80 + cursor_x);
+    // cursor_x == 80 adalah keadaan sah ("pindah baris di karakter berikutnya").
+    // Jangan diubah di sini; cukup batasi posisi cursor hardware.
+    int hw_x = (cursor_x > 79) ? 79 : cursor_x;
+    int hw_y = (cursor_y > 24) ? 24 : cursor_y;
+
+    u16 position = static_cast<u16>(hw_y * 80 + hw_x);
 
     outb(0x3D4, 0x0F);
     outb(0x3D5, static_cast<u8>(position & 0xFF));
@@ -228,16 +231,28 @@ static void read_line(char* buffer, int max_length) {
     }
 }
 
+// Membaca bilangan bulat tak negatif (maks 4 digit). Mengembalikan -1 jika kosong,
+// mengandung karakter selain angka, atau terlalu panjang.
+static int parse_number(const char* s) {
+    if (s[0] == '\0')
+        return -1;
+
+    int value = 0;
+    for (int i = 0; s[i] != '\0'; ++i) {
+        if (s[i] < '0' || s[i] > '9' || i >= 4)
+            return -1;
+        value = value * 10 + (s[i] - '0');
+    }
+    return value;
+}
+
 static int read_number(const char* prompt) {
     char input[16];
 
     print(prompt);
     read_line(input, 16);
 
-    if (input[0] >= '0' && input[0] <= '9')
-        return input[0] - '0';
-
-    return -1;
+    return parse_number(input);
 }
 
 static bool ask_yes_no(const char* question) {
@@ -469,6 +484,10 @@ static void show_help() {
     print("  help      - menampilkan daftar perintah\n");
     print("  about     - informasi tentang A2OS\n");
     print("  diagnosis - membuka asisten diagnosis\n");
+    print("  threads   - menampilkan daftar thread (alias: ps)\n");
+    print("  spawn     - membuat thread latar belakang (aktif ~10 detik)\n");
+    print("  kill <id> - menghentikan thread dengan id tersebut\n");
+    print("  menu      - kembali ke menu utama\n");
     print("  sched     - demo penjadwalan Round Robin preemptive\n");
     print("  race      - demo race condition (tanpa kunci)\n");
     print("  race lock - demo sinkronisasi dengan mutex\n");
@@ -817,6 +836,113 @@ static void demo_prodcons() {
     print("Selesai.\n\n");
 }
 
+// ======================================================================
+// Pengelolaan thread: tampilkan daftar thread dan buat thread latar belakang
+// ======================================================================
+
+// Tambahkan teks lalu isi spasi sampai teks yang ditambahkan selebar `width`.
+static void append_padded(char* dst, const char* src, int width) {
+    while (*dst) ++dst;
+    int n = 0;
+    while (*src) { *dst++ = *src++; ++n; }
+    while (n < width) { *dst++ = ' '; ++n; }
+    *dst = '\0';
+}
+
+static void append_uint_padded(char* dst, u32 v, int width) {
+    char num[12];
+    u32_to_str(v, num);
+    append_padded(dst, num, width);
+}
+
+// Perintah `threads` / `ps`: tabel semua thread beserta statusnya.
+static void show_threads() {
+    u32 now = sched_ticks();
+
+    print("Uptime penjadwal: ");
+    print_uint(now / TIMER_HZ);
+    print(" detik (");
+    print_uint(now);
+    print(" tick), quantum ");
+    print_uint(QUANTUM_TICKS);
+    print(" tick\n\n");
+
+    print("  ID  Nama      Status   CPU (tick)  CPU%  Dijadwalkan\n");
+    print("  --  --------  -------  ----------  ----  -----------\n");
+
+    int shown = 0;
+    for (int id = 0; id < MAX_TASKS; ++id) {
+        TaskInfo ti;
+        if (!task_get_info(id, &ti)) continue;
+
+        u32 pct = (now > 0) ? (ti.cpu_ticks * 100u) / now : 0;
+
+        char row[80];
+        row[0] = '\0';
+        append_padded(row, "", 2);
+        append_uint_padded(row, static_cast<u32>(id), 4);
+        append_padded(row, ti.name, 10);
+        append_padded(row, state_name(ti.state), 9);
+        append_uint_padded(row, ti.cpu_ticks, 12);
+        append_uint_padded(row, pct, 6);
+        append_uint_padded(row, ti.switches, 0);
+        append(row, "\n");
+        print(row);
+        ++shown;
+    }
+
+    print("\nTotal thread terdaftar: ");
+    print_uint(static_cast<u32>(shown));
+    print(" dari ");
+    print_uint(MAX_TASKS);
+    print(" slot. Id 0 = main (shell).\n");
+    print("Status: RUNNING = sedang memakai CPU, READY = menunggu giliran,\n");
+    print("        BLOCKED = menunggu mutex/semaphore, SELESAI = sudah berakhir.\n\n");
+}
+
+// Thread latar belakang: berputar ~10 detik berdasarkan jam timer lalu selesai.
+// Tidak mencetak apa pun supaya tidak mengganggu shell; amati lewat `threads`.
+static void worker_task() {
+    u32 start = sched_ticks();
+    while (sched_ticks() - start < 10 * TIMER_HZ) { }
+}
+
+// Perintah `spawn`: buat satu thread worker.
+static void spawn_worker() {
+    int id = task_create("worker", worker_task);
+    if (id < 0) {
+        print("Gagal membuat thread: semua slot terpakai. Tunggu thread selesai.\n\n");
+        return;
+    }
+    print("Thread 'worker' dibuat dengan id ");
+    print_uint(static_cast<u32>(id));
+    print(". Jalankan 'threads' untuk melihatnya (aktif ~10 detik).\n\n");
+}
+
+// Perintah `kill <id>`: hentikan thread. Pengaman ada di task_kill().
+static void kill_thread(const char* arg) {
+    int id = parse_number(arg);
+    if (id < 0) {
+        print("Penggunaan: kill <id>   (lihat id lewat 'threads')\n\n");
+        return;
+    }
+
+    int result = task_kill(id);
+    if (result == KILL_OK) {
+        print("Thread ");
+        print_uint(static_cast<u32>(id));
+        print(" dihentikan.\n\n");
+    } else if (result == KILL_MAIN) {
+        print("Ditolak: thread main (id 0) adalah shell dan tidak boleh dihentikan.\n\n");
+    } else if (result == KILL_SELF) {
+        print("Ditolak: thread yang sedang berjalan tidak bisa menghentikan dirinya sendiri.\n\n");
+    } else if (result == KILL_HOLDS_LOCK) {
+        print("Ditolak: thread sedang memegang mutex. Coba lagi sebentar lagi.\n\n");
+    } else {
+        print("Thread tidak ditemukan atau sudah selesai.\n\n");
+    }
+}
+
 static void shell() {
     char input[128];
 
@@ -833,6 +959,25 @@ static void shell() {
             show_about();
         } else if (equals(input, "diagnosis")) {
             run_diagnosis();
+        } else if (equals(input, "threads") || equals(input, "ps")) {
+            show_threads();
+        } else if (equals(input, "spawn")) {
+            spawn_worker();
+        } else if (equals(input, "kill")) {
+            kill_thread("");
+        } else if (input[0] == 'k' && input[1] == 'i' && input[2] == 'l' &&
+                   input[3] == 'l' && input[4] == ' ') {
+            kill_thread(input + 5);
+        } else if (equals(input, "menu")) {
+            return;                                 // kembali ke main_menu()
+        } else if (equals(input, "sched")) {
+            demo_sched();
+        } else if (equals(input, "race")) {
+            demo_race(false);
+        } else if (equals(input, "race lock")) {
+            demo_race(true);
+        } else if (equals(input, "prodcons")) {
+            demo_prodcons();
         } else if (equals(input, "ls")) {
             vfs_list();
         } else if (equals(input, "create")) {
@@ -844,16 +989,18 @@ static void shell() {
         } else if (equals(input, "rm")) {
             vfs_delete();
         } else if (equals(input, "whoami")) {
-            print(current_is_admin ? "Akun aktif: ADMIN\\n\\n" : "Akun aktif: USER\\n\\n");
+            print(current_is_admin ? "Akun aktif: ADMIN\n\n" : "Akun aktif: USER\n\n");
         } else if (equals(input, "logout")) {
             login();
             clear_screen();
             print_logo();
-            print("Ketik 'help' untuk melihat perintah.\\n\\n");
+            print("Ketik 'help' untuk melihat perintah.\n\n");
         } else if (equals(input, "clear")) {
             clear_screen();
             print_logo();
             print("Ketik 'help' untuk melihat perintah.\n\n");
+        } else if (equals(input, "echo")) {
+            print("\n");
         } else if (input[0] == 'e' && input[1] == 'c' &&
                 input[2] == 'h' && input[3] == 'o' &&
                 input[4] == ' ') {
@@ -907,6 +1054,9 @@ static void main_menu() {
 extern "C" void kernel_main() {
     clear_screen();
     enable_cursor();
+
+    // Aktifkan IDT, PIC, PIT, dan penjadwal preemptive (tugas utama = id 0).
+    sched_init();
 
     // Login ditampilkan pertama kali setelah kernel siap.
     // Menu utama baru dibuka setelah username dan password valid.

@@ -9,7 +9,7 @@
 bool mutex_trylock(Mutex* m) {
     u32 f = irq_save();
     bool ok = (m->locked == 0);
-    if (ok) { m->locked = 1; m->owner = task_current(); }
+    if (ok) { m->locked = 1; m->owner = task_current(); task_lock_delta(1); }
     irq_restore(f);
     return ok;
 }
@@ -20,6 +20,7 @@ void mutex_lock(Mutex* m) {
         if (m->locked == 0) {
             m->locked = 1;
             m->owner  = task_current();
+            task_lock_delta(1);
             irq_restore(f);
             return;
         }
@@ -34,6 +35,7 @@ void mutex_unlock(Mutex* m) {
     if (m->locked && m->owner == task_current()) {
         m->locked = 0;
         m->owner  = -1;
+        task_lock_delta(-1);
         task_wake_all(m);
     }
     irq_restore(f);

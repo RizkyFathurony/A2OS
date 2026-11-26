@@ -1,0 +1,389 @@
+diff --git a/README.md b/README.md
+index 44c7cee..c0500e2 100644
+--- a/README.md
++++ b/README.md
+@@ -36,13 +36,25 @@ terfokus. Keluar dari QEMU dengan `Ctrl+Alt+G` atau tutup jendelanya.
+ 
+ ## Catatan
+ 
+-- Ini adalah prototype awal untuk memenuhi demonstrasi boot, logo ASCII, dan
+-  shell internal; belum mengimplementasikan scheduler, mutex, allocator,
+-  filesystem, atau proteksi akses.
++- Sudah ada: boot GRUB Multiboot, login, asisten diagnosis, penjadwal Round Robin
++  preemptive, mutex, semaphore, dan RAMDisk sederhana dengan hak akses Admin/User.
++- Belum ada: alokator memori dinamis dan deteksi deadlock.
+ - Kernel berjalan dalam mode x86 32-bit dan memakai VGA text mode serta polling
+-  keyboard PS/2 untuk tahap awal.
++  keyboard PS/2 (hanya IRQ0 timer yang aktif untuk penjadwal).
+ - Jangan menganggap pesan boot sebagai bukti fitur yang belum diimplementasikan.
+ 
++## Pengelolaan thread (shell: menu 2 "Terminal A2OS")
++
++- `threads` (alias `ps`): tabel semua thread: id, nama, status (RUNNING / READY /
++  BLOCKED / SELESAI), CPU (tick dan persen), dan berapa kali dijadwalkan. Id 0 = `main` (shell).
++- `spawn`: membuat thread `worker` yang aktif sekitar 10 detik. Jalankan `spawn`
++  beberapa kali lalu `threads` untuk melihat thread bergantian memakai CPU.
++  Maksimal 6 slot thread, termasuk `main`.
++- `kill <id>`: menghentikan thread. Ditolak untuk `main` (id 0), thread yang sedang
++  berjalan, dan thread yang sedang memegang mutex (supaya mutex tidak terkunci selamanya).
++  Thread yang menunggu semaphore boleh dihentikan, tetapi hitungan semaphore tidak dipulihkan.
++- `menu`: kembali ke menu utama.
++
+ ## Demo penjadwalan & sinkronisasi (shell: menu 2 "Terminal A2OS")
+ 
+ - `sched`: 3 tugas (A, B, C) dijadwalkan Round Robin secara preemptive.
+diff --git a/boot/boot.asm b/boot/boot.asm
+index f79bf06..18f33fb 100644
+--- a/boot/boot.asm
++++ b/boot/boot.asm
+@@ -24,3 +24,5 @@ _start:
+     cli
+     hlt
+     jmp .hang
++
++section .note.GNU-stack noalloc noexec nowrite progbits
+diff --git a/kernel/kernel.cpp b/kernel/kernel.cpp
+index 51a3f9e..2c0e2ec 100644
+--- a/kernel/kernel.cpp
++++ b/kernel/kernel.cpp
+@@ -43,11 +43,14 @@ static inline void outl(u16 port, u32 value) {
+ // Perbarui posisi hardware cursor VGA (mode teks 80x25).
+ static void update_cursor() {
+     if (cursor_x < 0) cursor_x = 0;
+-    if (cursor_x > 79) cursor_x = 79;
+     if (cursor_y < 0) cursor_y = 0;
+-    if (cursor_y > 24) cursor_y = 24;
+ 
+-    u16 position = static_cast<u16>(cursor_y * 80 + cursor_x);
++    // cursor_x == 80 adalah keadaan sah ("pindah baris di karakter berikutnya").
++    // Jangan diubah di sini; cukup batasi posisi cursor hardware.
++    int hw_x = (cursor_x > 79) ? 79 : cursor_x;
++    int hw_y = (cursor_y > 24) ? 24 : cursor_y;
++
++    u16 position = static_cast<u16>(hw_y * 80 + hw_x);
+ 
+     outb(0x3D4, 0x0F);
+     outb(0x3D5, static_cast<u8>(position & 0xFF));
+@@ -228,16 +231,28 @@ static void read_line(char* buffer, int max_length) {
+     }
+ }
+ 
++// Membaca bilangan bulat tak negatif (maks 4 digit). Mengembalikan -1 jika kosong,
++// mengandung karakter selain angka, atau terlalu panjang.
++static int parse_number(const char* s) {
++    if (s[0] == '\0')
++        return -1;
++
++    int value = 0;
++    for (int i = 0; s[i] != '\0'; ++i) {
++        if (s[i] < '0' || s[i] > '9' || i >= 4)
++            return -1;
++        value = value * 10 + (s[i] - '0');
++    }
++    return value;
++}
++
+ static int read_number(const char* prompt) {
+     char input[16];
+ 
+     print(prompt);
+     read_line(input, 16);
+ 
+-    if (input[0] >= '0' && input[0] <= '9')
+-        return input[0] - '0';
+-
+-    return -1;
++    return parse_number(input);
+ }
+ 
+ static bool ask_yes_no(const char* question) {
+@@ -469,6 +484,10 @@ static void show_help() {
+     print("  help      - menampilkan daftar perintah\n");
+     print("  about     - informasi tentang A2OS\n");
+     print("  diagnosis - membuka asisten diagnosis\n");
++    print("  threads   - menampilkan daftar thread (alias: ps)\n");
++    print("  spawn     - membuat thread latar belakang (aktif ~10 detik)\n");
++    print("  kill <id> - menghentikan thread dengan id tersebut\n");
++    print("  menu      - kembali ke menu utama\n");
+     print("  sched     - demo penjadwalan Round Robin preemptive\n");
+     print("  race      - demo race condition (tanpa kunci)\n");
+     print("  race lock - demo sinkronisasi dengan mutex\n");
+@@ -817,6 +836,113 @@ static void demo_prodcons() {
+     print("Selesai.\n\n");
+ }
+ 
++// ======================================================================
++// Pengelolaan thread: tampilkan daftar thread dan buat thread latar belakang
++// ======================================================================
++
++// Tambahkan teks lalu isi spasi sampai teks yang ditambahkan selebar `width`.
++static void append_padded(char* dst, const char* src, int width) {
++    while (*dst) ++dst;
++    int n = 0;
++    while (*src) { *dst++ = *src++; ++n; }
++    while (n < width) { *dst++ = ' '; ++n; }
++    *dst = '\0';
++}
++
++static void append_uint_padded(char* dst, u32 v, int width) {
++    char num[12];
++    u32_to_str(v, num);
++    append_padded(dst, num, width);
++}
++
++// Perintah `threads` / `ps`: tabel semua thread beserta statusnya.
++static void show_threads() {
++    u32 now = sched_ticks();
++
++    print("Uptime penjadwal: ");
++    print_uint(now / TIMER_HZ);
++    print(" detik (");
++    print_uint(now);
++    print(" tick), quantum ");
++    print_uint(QUANTUM_TICKS);
++    print(" tick\n\n");
++
++    print("  ID  Nama      Status   CPU (tick)  CPU%  Dijadwalkan\n");
++    print("  --  --------  -------  ----------  ----  -----------\n");
++
++    int shown = 0;
++    for (int id = 0; id < MAX_TASKS; ++id) {
++        TaskInfo ti;
++        if (!task_get_info(id, &ti)) continue;
++
++        u32 pct = (now > 0) ? (ti.cpu_ticks * 100u) / now : 0;
++
++        char row[80];
++        row[0] = '\0';
++        append_padded(row, "", 2);
++        append_uint_padded(row, static_cast<u32>(id), 4);
++        append_padded(row, ti.name, 10);
++        append_padded(row, state_name(ti.state), 9);
++        append_uint_padded(row, ti.cpu_ticks, 12);
++        append_uint_padded(row, pct, 6);
++        append_uint_padded(row, ti.switches, 0);
++        append(row, "\n");
++        print(row);
++        ++shown;
++    }
++
++    print("\nTotal thread terdaftar: ");
++    print_uint(static_cast<u32>(shown));
++    print(" dari ");
++    print_uint(MAX_TASKS);
++    print(" slot. Id 0 = main (shell).\n");
++    print("Status: RUNNING = sedang memakai CPU, READY = menunggu giliran,\n");
++    print("        BLOCKED = menunggu mutex/semaphore, SELESAI = sudah berakhir.\n\n");
++}
++
++// Thread latar belakang: berputar ~10 detik berdasarkan jam timer lalu selesai.
++// Tidak mencetak apa pun supaya tidak mengganggu shell; amati lewat `threads`.
++static void worker_task() {
++    u32 start = sched_ticks();
++    while (sched_ticks() - start < 10 * TIMER_HZ) { }
++}
++
++// Perintah `spawn`: buat satu thread worker.
++static void spawn_worker() {
++    int id = task_create("worker", worker_task);
++    if (id < 0) {
++        print("Gagal membuat thread: semua slot terpakai. Tunggu thread selesai.\n\n");
++        return;
++    }
++    print("Thread 'worker' dibuat dengan id ");
++    print_uint(static_cast<u32>(id));
++    print(". Jalankan 'threads' untuk melihatnya (aktif ~10 detik).\n\n");
++}
++
++// Perintah `kill <id>`: hentikan thread. Pengaman ada di task_kill().
++static void kill_thread(const char* arg) {
++    int id = parse_number(arg);
++    if (id < 0) {
++        print("Penggunaan: kill <id>   (lihat id lewat 'threads')\n\n");
++        return;
++    }
++
++    int result = task_kill(id);
++    if (result == KILL_OK) {
++        print("Thread ");
++        print_uint(static_cast<u32>(id));
++        print(" dihentikan.\n\n");
++    } else if (result == KILL_MAIN) {
++        print("Ditolak: thread main (id 0) adalah shell dan tidak boleh dihentikan.\n\n");
++    } else if (result == KILL_SELF) {
++        print("Ditolak: thread yang sedang berjalan tidak bisa menghentikan dirinya sendiri.\n\n");
++    } else if (result == KILL_HOLDS_LOCK) {
++        print("Ditolak: thread sedang memegang mutex. Coba lagi sebentar lagi.\n\n");
++    } else {
++        print("Thread tidak ditemukan atau sudah selesai.\n\n");
++    }
++}
++
+ static void shell() {
+     char input[128];
+ 
+@@ -833,6 +959,25 @@ static void shell() {
+             show_about();
+         } else if (equals(input, "diagnosis")) {
+             run_diagnosis();
++        } else if (equals(input, "threads") || equals(input, "ps")) {
++            show_threads();
++        } else if (equals(input, "spawn")) {
++            spawn_worker();
++        } else if (equals(input, "kill")) {
++            kill_thread("");
++        } else if (input[0] == 'k' && input[1] == 'i' && input[2] == 'l' &&
++                   input[3] == 'l' && input[4] == ' ') {
++            kill_thread(input + 5);
++        } else if (equals(input, "menu")) {
++            return;                                 // kembali ke main_menu()
++        } else if (equals(input, "sched")) {
++            demo_sched();
++        } else if (equals(input, "race")) {
++            demo_race(false);
++        } else if (equals(input, "race lock")) {
++            demo_race(true);
++        } else if (equals(input, "prodcons")) {
++            demo_prodcons();
+         } else if (equals(input, "ls")) {
+             vfs_list();
+         } else if (equals(input, "create")) {
+@@ -844,16 +989,18 @@ static void shell() {
+         } else if (equals(input, "rm")) {
+             vfs_delete();
+         } else if (equals(input, "whoami")) {
+-            print(current_is_admin ? "Akun aktif: ADMIN\\n\\n" : "Akun aktif: USER\\n\\n");
++            print(current_is_admin ? "Akun aktif: ADMIN\n\n" : "Akun aktif: USER\n\n");
+         } else if (equals(input, "logout")) {
+             login();
+             clear_screen();
+             print_logo();
+-            print("Ketik 'help' untuk melihat perintah.\\n\\n");
++            print("Ketik 'help' untuk melihat perintah.\n\n");
+         } else if (equals(input, "clear")) {
+             clear_screen();
+             print_logo();
+             print("Ketik 'help' untuk melihat perintah.\n\n");
++        } else if (equals(input, "echo")) {
++            print("\n");
+         } else if (input[0] == 'e' && input[1] == 'c' &&
+                 input[2] == 'h' && input[3] == 'o' &&
+                 input[4] == ' ') {
+@@ -908,6 +1055,9 @@ extern "C" void kernel_main() {
+     clear_screen();
+     enable_cursor();
+ 
++    // Aktifkan IDT, PIC, PIT, dan penjadwal preemptive (tugas utama = id 0).
++    sched_init();
++
+     // Login ditampilkan pertama kali setelah kernel siap.
+     // Menu utama baru dibuka setelah username dan password valid.
+     login();
+diff --git a/kernel/scheduler.cpp b/kernel/scheduler.cpp
+index 397d3e2..69cba58 100644
+--- a/kernel/scheduler.cpp
++++ b/kernel/scheduler.cpp
+@@ -62,6 +62,7 @@ struct Task {
+     int         state;
+     const char* name;
+     const void* waiting;      // objek sinkronisasi yang ditunggu (jika BLOCKED)
++    int         held_locks;   // jumlah mutex yang sedang dipegang tugas ini
+     u32         cpu_ticks;
+     u32         switches;
+ };
+@@ -155,6 +156,7 @@ int task_create(const char* name, void (*entry)()) {
+     tasks[id].state     = TASK_READY;
+     tasks[id].name      = name;
+     tasks[id].waiting   = nullptr;
++    tasks[id].held_locks = 0;
+     tasks[id].cpu_ticks = 0;
+     tasks[id].switches  = 0;
+ 
+@@ -200,6 +202,35 @@ void task_wake_all(const void* obj) {
+     }
+ }
+ 
++void task_lock_delta(int delta) {
++    tasks[current].held_locks += delta;
++    if (tasks[current].held_locks < 0) tasks[current].held_locks = 0;
++}
++
++int task_kill(int id) {
++    u32 f = irq_save();
++    int result;
++
++    if (id == 0) {
++        result = KILL_MAIN;
++    } else if (id < 0 || id >= MAX_TASKS ||
++               tasks[id].state == TASK_FREE || tasks[id].state == TASK_DEAD) {
++        result = KILL_INVALID;
++    } else if (id == current) {
++        result = KILL_SELF;
++    } else if (tasks[id].held_locks > 0) {
++        result = KILL_HOLDS_LOCK;
++    } else {
++        // Tugas ditandai DEAD: tidak akan dijadwalkan lagi dan slotnya bisa dipakai ulang.
++        tasks[id].state   = TASK_DEAD;
++        tasks[id].waiting = nullptr;
++        result = KILL_OK;
++    }
++
++    irq_restore(f);
++    return result;
++}
++
+ void sched_init() {
+     // Selector kode dibaca dari CS saat ini supaya cocok dengan GDT bawaan GRUB.
+     u16 cs;
+diff --git a/kernel/scheduler.h b/kernel/scheduler.h
+index 8626b71..fe81b6f 100644
+--- a/kernel/scheduler.h
++++ b/kernel/scheduler.h
+@@ -27,6 +27,11 @@ u32  sched_ticks();                                 // jumlah tick sejak boot
+ bool task_get_info(int id, TaskInfo* out);
+ bool sched_all_done(int first_id);                  // semua tugas id >= first_id sudah selesai?
+ 
++// Hentikan paksa sebuah thread. Ditolak jika thread itu main (id 0), thread yang sedang
++// berjalan, atau thread yang sedang memegang mutex (agar mutex tidak terkunci selamanya).
++enum KillResult : int { KILL_OK = 0, KILL_INVALID, KILL_MAIN, KILL_SELF, KILL_HOLDS_LOCK };
++int  task_kill(int id);
++
+ // ---------- Sinkronisasi ----------
+ u32  irq_save();                 // matikan interrupt, kembalikan EFLAGS lama
+ void irq_restore(u32 flags);
+@@ -43,5 +48,6 @@ void sem_wait(Semaphore* s);     // P / down: blok jika count == 0
+ void sem_post(Semaphore* s);     // V / up
+ 
+ // Dipakai internal oleh sync.cpp
++void task_lock_delta(int delta);       // catat mutex dipegang (+1) / dilepas (-1) oleh tugas sekarang (IF=0)
+ void task_block_on(const void* obj);   // tandai tugas sekarang BLOCKED menunggu obj (panggil saat IF=0)
+ void task_wake_all(const void* obj);   // bangunkan semua tugas yang menunggu obj (panggil saat IF=0)
+diff --git a/kernel/sync.cpp b/kernel/sync.cpp
+index 95cb1bc..69d399b 100644
+--- a/kernel/sync.cpp
++++ b/kernel/sync.cpp
+@@ -9,7 +9,7 @@
+ bool mutex_trylock(Mutex* m) {
+     u32 f = irq_save();
+     bool ok = (m->locked == 0);
+-    if (ok) { m->locked = 1; m->owner = task_current(); }
++    if (ok) { m->locked = 1; m->owner = task_current(); task_lock_delta(1); }
+     irq_restore(f);
+     return ok;
+ }
+@@ -20,6 +20,7 @@ void mutex_lock(Mutex* m) {
+         if (m->locked == 0) {
+             m->locked = 1;
+             m->owner  = task_current();
++            task_lock_delta(1);
+             irq_restore(f);
+             return;
+         }
+@@ -34,6 +35,7 @@ void mutex_unlock(Mutex* m) {
+     if (m->locked && m->owner == task_current()) {
+         m->locked = 0;
+         m->owner  = -1;
++        task_lock_delta(-1);
+         task_wake_all(m);
+     }
+     irq_restore(f);
