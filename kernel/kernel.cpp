@@ -1,6 +1,4 @@
-using u8  = unsigned char;
-using u16 = unsigned short;
-using u32 = unsigned int;
+#include "scheduler.h"
 
 static volatile u16* const VGA = reinterpret_cast<volatile u16*>(0xB8000);
 static const u8 COLOR = 0x0F;
@@ -15,8 +13,25 @@ static int cursor_x = 0;
 static int cursor_y = 0;
 
 // Status keyboard dibuat global agar tetap konsisten di shell dan menu diagnosis.
-static bool shift_down = false;
+static bool shift_down   = false;
 static bool caps_lock = false;
+
+
+// Hak akses sederhana: Admin memiliki akses penuh, User hanya mengelola
+// berkas yang dibuat oleh akunnya sendiri.
+static bool current_is_admin = false;
+static const int MAX_FILES = 8;
+static const int FILE_NAME_SIZE = 24;
+static const int FILE_CONTENT_SIZE = 160;
+
+struct RamFile {
+    bool used;
+    bool owner_is_admin;
+    char name[FILE_NAME_SIZE];
+    char content[FILE_CONTENT_SIZE];
+};
+
+static RamFile ram_files[MAX_FILES];
 
 static inline u8 inb(u16 port) {
     u8 value;
@@ -35,11 +50,14 @@ static inline void outl(u16 port, u32 value) {
 // Perbarui posisi hardware cursor VGA (mode teks 80x25).
 static void update_cursor() {
     if (cursor_x < 0) cursor_x = 0;
-    if (cursor_x > 79) cursor_x = 79;
     if (cursor_y < 0) cursor_y = 0;
-    if (cursor_y > 24) cursor_y = 24;
 
-    u16 position = static_cast<u16>(cursor_y * 80 + cursor_x);
+    // cursor_x == 80 adalah keadaan sah ("pindah baris di karakter berikutnya").
+    // Jangan diubah di sini; cukup batasi posisi cursor hardware.
+    int hw_x = (cursor_x > 79) ? 79 : cursor_x;
+    int hw_y = (cursor_y > 24) ? 24 : cursor_y;
+
+    u16 position = static_cast<u16>(hw_y * 80 + hw_x);
 
     outb(0x3D4, 0x0F);
     outb(0x3D5, static_cast<u8>(position & 0xFF));
@@ -101,17 +119,26 @@ static void put_char(char c) {
     update_cursor();
 }
 
+// Mutex konsol: mencegah keluaran beberapa tugas saling tercampur di layar VGA.
+static Mutex console_lock = {0, -1};
+
 static void print(const char* s) {
+    mutex_lock(&console_lock);
     while (*s)
         put_char(*s++);
+    mutex_unlock(&console_lock);
 }
 
 // Cetak teks dengan warna tertentu, lalu kembalikan warna semula.
+// Warna diubah di dalam console_lock agar tidak bocor ke tugas lain.
 static void print_colored(const char* s, u8 color) {
+    mutex_lock(&console_lock);
     u8 old = text_color;
     text_color = color;
-    print(s);
+    while (*s)
+        put_char(*s++);
     text_color = old;
+    mutex_unlock(&console_lock);
 }
 
 // Tingkat kendala hasil diagnosis.
@@ -254,26 +281,252 @@ static void read_line(char* buffer, int max_length) {
     }
 }
 
+// Membaca bilangan bulat tak negatif (maks 4 digit). Mengembalikan -1 jika kosong,
+// mengandung karakter selain angka, atau terlalu panjang.
+static int parse_number(const char* s) {
+    if (s[0] == '\0')
+        return -1;
+
+    int value = 0;
+    for (int i = 0; s[i] != '\0'; ++i) {
+        if (s[i] < '0' || s[i] > '9' || i >= 4)
+            return -1;
+        value = value * 10 + (s[i] - '0');
+    }
+    return value;
+}
+
 static int read_number(const char* prompt) {
     char input[16];
 
     print(prompt);
     read_line(input, 16);
 
-    if (input[0] >= '0' && input[0] <= '9')
-        return input[0] - '0';
-
-    return -1;
+    return parse_number(input);
 }
 
 static bool ask_yes_no(const char* question) {
     char answer[8];
 
-    print(question);
-    print(" (y/n): ");
-    read_line(answer, 8);
+    while (true) {
+        print(question);
+        print(" (y/n atau yes/no): ");
+        read_line(answer, 8);
 
-    return answer[0] == 'y' || answer[0] == 'Y';
+        if ((answer[0] == 'y' || answer[0] == 'Y') && answer[1] == '\0')
+            return true;
+
+        if ((answer[0] == 'y' || answer[0] == 'Y') &&
+            (answer[1] == 'e' || answer[1] == 'E') &&
+            (answer[2] == 's' || answer[2] == 'S') &&
+            answer[3] == '\0')
+            return true;
+
+        if ((answer[0] == 'n' || answer[0] == 'N') && answer[1] == '\0')
+            return false;
+
+        if ((answer[0] == 'n' || answer[0] == 'N') &&
+            (answer[1] == 'o' || answer[1] == 'O') &&
+            answer[2] == '\0')
+            return false;
+
+        print("Input tidak valid. Masukkan y, yes, n, atau no.\n");
+    }
+}
+
+// ---------- VFS RAMDisk sederhana ----------
+
+static void copy_string(char* destination, const char* source, int max_size) {
+    int i = 0;
+    while (source[i] && i < max_size - 1) {
+        destination[i] = source[i];
+        ++i;
+    }
+    destination[i] = '\0';
+}
+
+static int find_file(const char* name) {
+    for (int i = 0; i < MAX_FILES; ++i) {
+        if (ram_files[i].used && equals(ram_files[i].name, name))
+            return i;
+    }
+    return -1;
+}
+
+static bool can_access_file(int index) {
+    if (index < 0 || index >= MAX_FILES || !ram_files[index].used)
+        return false;
+
+    return current_is_admin ||
+           ram_files[index].owner_is_admin == current_is_admin;
+}
+
+static void vfs_list() {
+    bool found = false;
+    print("Daftar berkas:\n");
+
+    for (int i = 0; i < MAX_FILES; ++i) {
+        if (!ram_files[i].used)
+            continue;
+
+        if (!current_is_admin && ram_files[i].owner_is_admin)
+            continue;
+
+        print("  ");
+        print(ram_files[i].name);
+        print(ram_files[i].owner_is_admin ? " [ADMIN]\n" : " [USER]\n");
+        found = true;
+    }
+
+    if (!found)
+        print("  Belum ada berkas yang dapat ditampilkan.\n");
+    print("\n");
+}
+
+static void vfs_create() {
+    char name[FILE_NAME_SIZE];
+    char content[FILE_CONTENT_SIZE];
+
+    print("Nama file (tanpa spasi): ");
+    read_line(name, FILE_NAME_SIZE);
+
+    if (name[0] == '\0') {
+        print("Nama file tidak boleh kosong.\n\n");
+        return;
+    }
+
+    if (find_file(name) >= 0) {
+        print("Nama file sudah digunakan.\n\n");
+        return;
+    }
+
+    int slot = -1;
+    for (int i = 0; i < MAX_FILES; ++i) {
+        if (!ram_files[i].used) {
+            slot = i;
+            break;
+        }
+    }
+
+    if (slot < 0) {
+        print("RAMDisk penuh. Hapus berkas yang tidak diperlukan.\n\n");
+        return;
+    }
+
+    print("Isi file: ");
+    read_line(content, FILE_CONTENT_SIZE);
+
+    ram_files[slot].used = true;
+    ram_files[slot].owner_is_admin = current_is_admin;
+    copy_string(ram_files[slot].name, name, FILE_NAME_SIZE);
+    copy_string(ram_files[slot].content, content, FILE_CONTENT_SIZE);
+
+    print("File berhasil dibuat.\n\n");
+}
+
+static void vfs_read() {
+    char name[FILE_NAME_SIZE];
+    print("Nama file: ");
+    read_line(name, FILE_NAME_SIZE);
+
+    int index = find_file(name);
+    if (index < 0) {
+        print("File tidak ditemukan.\n\n");
+        return;
+    }
+
+    if (!can_access_file(index)) {
+        print("Akses ditolak. File ini milik Admin.\n\n");
+        return;
+    }
+
+    print("Isi ");
+    print(ram_files[index].name);
+    print(":\n");
+    print(ram_files[index].content);
+    print("\n\n");
+}
+
+static void vfs_write() {
+    char name[FILE_NAME_SIZE];
+    char content[FILE_CONTENT_SIZE];
+
+    print("Nama file: ");
+    read_line(name, FILE_NAME_SIZE);
+
+    int index = find_file(name);
+    if (index < 0) {
+        print("File tidak ditemukan.\n\n");
+        return;
+    }
+
+    if (!can_access_file(index)) {
+        print("Akses ditolak. Anda bukan pemilik file.\n\n");
+        return;
+    }
+
+    print("Isi baru: ");
+    read_line(content, FILE_CONTENT_SIZE);
+    copy_string(ram_files[index].content, content, FILE_CONTENT_SIZE);
+    print("File berhasil diperbarui.\n\n");
+}
+
+static void vfs_delete() {
+    char name[FILE_NAME_SIZE];
+    print("Nama file: ");
+    read_line(name, FILE_NAME_SIZE);
+
+    int index = find_file(name);
+    if (index < 0) {
+        print("File tidak ditemukan.\n\n");
+        return;
+    }
+
+    if (!can_access_file(index)) {
+        print("Akses ditolak. Anda bukan pemilik file.\n\n");
+        return;
+    }
+
+    ram_files[index].used = false;
+    ram_files[index].name[0] = '\0';
+    ram_files[index].content[0] = '\0';
+    print("File berhasil dihapus.\n\n");
+}
+
+static bool login() {
+    char username[24];
+    char password[24];
+
+    while (true) {
+        clear_screen();
+        print_logo();
+        print("          A2OS LOGIN\n\n");
+        print("Akun demo:\n");
+        print("  Admin : admin / admin123\n");
+        print("  User  : user  / user123\n\n");
+
+        print("Username: ");
+        read_line(username, 24);
+        print("Password: ");
+        read_line(password, 24);
+
+        if (equals(username, "admin") && equals(password, "admin123")) {
+            current_is_admin = true;
+            print("Login sebagai Admin berhasil.\n");
+            return true;
+        }
+
+        if (equals(username, "user") && equals(password, "user123")) {
+            current_is_admin = false;
+            print("Login sebagai User berhasil.\n");
+            return true;
+        }
+
+        print("Username atau password salah.\n");
+        print("Tekan Enter untuk mencoba lagi...");
+        char wait[4];
+        read_line(wait, 4);
+    }
 }
 
 static void show_help() {
@@ -281,10 +534,24 @@ static void show_help() {
     print("  help      - menampilkan daftar perintah\n");
     print("  about     - informasi tentang A2OS\n");
     print("  diagnosis - membuka asisten diagnosis\n");
+    print("  threads   - menampilkan daftar thread (alias: ps)\n");
+    print("  spawn     - membuat thread latar belakang (aktif ~10 detik)\n");
+    print("  kill <id> - menghentikan thread dengan id tersebut\n");
+    print("  menu      - kembali ke menu utama\n");
+    print("  sched     - demo penjadwalan Round Robin preemptive\n");
+    print("  race      - demo race condition (tanpa kunci)\n");
+    print("  race lock - demo sinkronisasi dengan mutex\n");
+    print("  prodcons  - demo semaphore (produsen-konsumen)\n");
     print("  clear     - membersihkan layar\n");
     print("  echo      - menampilkan teks\n");
-    print("  shutdown  - mematikan A2OS (hanya di QEMU)\n");
-    print("  exit      - keluar dari A2OS dan QEMU\n\n");
+    print("  ls        - melihat daftar file RAMDisk\n");
+    print("  create    - membuat file teks\n");
+    print("  cat       - membaca isi file\n");
+    print("  write     - mengubah isi file\n");
+    print("  rm        - menghapus file\n");
+    print("  whoami    - melihat akun aktif\n");
+    print("  logout    - keluar dari akun\n");
+    print("  shutdown  - mematikan A2OS \n\n");
 }
 
 // Hanya bekerja jika QEMU dijalankan dengan perangkat isa-debug-exit.
@@ -309,72 +576,39 @@ static void show_diagnosis_result(int device, int category, int yes_count, bool 
     print_severity(determine_severity(category, yes_count, answer_three));
 
     if (category == 1) {
-        print("Kategori  : Baterai / daya\n");
+        print("Kategori  : Baterai / pengisian daya\n");
         if (answer_three) {
             print("Temuan    : Ada indikasi kondisi baterai tidak normal.\n");
             print("Saran     : Hentikan penggunaan jika baterai tampak membengkak atau terlalu panas.\n");
             print("            Minta teknisi memeriksa baterai dan rangkaian daya.\n");
         } else if (yes_count >= 2) {
-            print("Kemungkinan: Kapasitas baterai menurun atau konsumsi daya berlebih.\n");
-            print("Saran      : Periksa kesehatan baterai dan aplikasi yang banyak memakai daya.\n");
+            print("Kemungkinan: Baterai, kabel/adaptor, konektor, atau rangkaian charging bermasalah.\n");
+            print("Saran      : Uji aksesori pengisi daya yang sesuai dan periksa kesehatan baterai.\n");
         } else {
             print("Kemungkinan: Gangguan daya belum dapat dipastikan dari gejala ini.\n");
             print("Saran      : Periksa adaptor, konektor, dan kondisi baterai lebih lanjut.\n");
         }
     } else if (category == 2) {
-        print("Kategori  : Pengisian daya\n");
+        print("Kategori  : Layar / komponen input\n");
         if (yes_count >= 2) {
-            print("Kemungkinan: Kabel/adaptor, konektor, atau jalur pengisian bermasalah.\n");
-            print("Saran      : Uji dengan aksesori pengisi daya yang sesuai dan teruji.\n");
-            print("            Jika tetap gagal, periksa konektor dan rangkaian charging.\n");
+            print("Kemungkinan: Layar, komponen input, kabel fleksibel, atau driver bermasalah.\n");
+            print("Saran      : Periksa kondisi layar dan uji fungsi sentuh/keyboard/touchpad.\n");
         } else {
-            print("Kemungkinan: Gangguan pengisian belum terlihat jelas.\n");
-            print("Saran      : Amati apakah pengisian terputus-putus dan periksa aksesori.\n");
-        }
-    } else if (category == 3) {
-        print("Kategori  : Layar / tampilan\n");
-        if (yes_count >= 2) {
-            print("Kemungkinan: Panel layar, kabel fleksibel, atau pengaturan tampilan bermasalah.\n");
-            print("Saran      : Periksa kondisi fisik layar dan lakukan pemeriksaan komponen.\n");
-        } else {
-            print("Kemungkinan: Gangguan tampilan mungkin terkait perangkat lunak atau koneksi layar.\n");
-            print("Saran      : Coba mulai ulang perangkat dan amati apakah gejala berulang.\n");
-        }
-    } else if (category == 4) {
-        print("Kategori  : Performa lambat\n");
-        if (yes_count >= 2) {
-            print("Kemungkinan: Beban aplikasi tinggi, penyimpanan hampir penuh, atau sistem bermasalah.\n");
-            print("Saran      : Periksa ruang penyimpanan, aplikasi berjalan, dan pembaruan sistem.\n");
-        } else {
-            print("Kemungkinan: Perlambatan belum menunjukkan satu penyebab yang jelas.\n");
-            print("Saran      : Pantau aplikasi yang berjalan dan mulai ulang perangkat.\n");
-        }
-    } else if (category == 5) {
-        if (device == 1)
-            print("Kategori  : Layar sentuh\n");
-        else
-            print("Kategori  : Keyboard / touchpad\n");
-
-        if (yes_count >= 2) {
-            print("Kemungkinan: Komponen input atau driver/perangkat lunak mengalami gangguan.\n");
-            print("Saran      : Periksa pengaturan/driver dan lakukan pengujian komponen.\n");
-        } else {
-            print("Kemungkinan: Gangguan input belum dapat dipastikan.\n");
-            print("Saran      : Mulai ulang perangkat dan uji kembali fungsi input.\n");
+            print("Kemungkinan: Gangguan layar atau komponen input belum dapat dipastikan.\n");
+            print("Saran      : Mulai ulang perangkat dan lakukan pengujian komponen.\n");
         }
     } else {
-        print("Kategori  : Sistem operasi / booting\n");
+        print("Kategori  : Performa / sistem operasi\n");
         if (yes_count >= 2) {
-            print("Kemungkinan: Sistem operasi, file sistem, atau proses boot mengalami gangguan.\n");
-            print("Saran      : Catat pesan error dan lakukan pemeriksaan sistem terlebih dahulu.\n");
+            print("Kemungkinan: Beban aplikasi tinggi, penyimpanan penuh, atau sistem operasi bermasalah.\n");
+            print("Saran      : Periksa ruang penyimpanan, aplikasi berjalan, dan pesan error sistem.\n");
         } else {
-            print("Kemungkinan: Gangguan sistem belum menunjukkan penyebab yang pasti.\n");
-            print("Saran      : Periksa pesan error dan perubahan terakhir pada perangkat.\n");
+            print("Kemungkinan: Gangguan performa atau sistem belum menunjukkan penyebab pasti.\n");
+            print("Saran      : Mulai ulang perangkat dan amati apakah masalah muncul kembali.\n");
         }
     }
 
-    print("-----------------------------------------\n");
-    print("Analisis awal berdasarkan jawaban pelanggan.\n\n");
+    print("-----------------------------------------\n\n");
 }
 
 static void run_diagnosis() {
@@ -390,40 +624,34 @@ static void run_diagnosis() {
     print("  2. Laptop\n");
     print("  0. Kembali\n\n");
 
-    while (device < 0 || device > 2) {
+    // Gunakan do-while agar input pertama benar-benar dibaca.
+    do {
         device = read_number("Pilihan: ");
         if (device < 0 || device > 2)
             print("Pilihan tidak valid. Masukkan 0, 1, atau 2.\n");
-    }
+    } while (device < 0 || device > 2);
 
     if (device == 0)
         return;
 
     clear_screen();
     print("PILIH KATEGORI MASALAH\n\n");
-    print("  1. Baterai / perangkat cepat mati\n");
-    print("  2. Pengisian daya / tidak bisa charging\n");
-    print("  3. Layar / tampilan\n");
-    print("  4. Performa lambat\n");
-    if (device == 1)
-        print("  5. Layar sentuh tidak responsif\n");
-    else
-        print("  5. Keyboard / touchpad bermasalah\n");
-    print("  6. Sistem operasi / gagal booting\n");
+    print("  1. Baterai / pengisian daya bermasalah\n");
+    print("  2. Layar / komponen input bermasalah\n");
+    print("  3. Performa lambat / sistem operasi bermasalah\n");
     print("  0. Kembali\n\n");
 
-    while (category < 0 || category > 6) {
+    do {
         category = read_number("Kategori: ");
-        if (category < 0 || category > 6)
-            print("Pilihan tidak valid. Masukkan angka 0 sampai 6.\n");
-    }
+        if (category < 0 || category > 3)
+            print("Pilihan tidak valid. Masukkan angka 0 sampai 3.\n");
+    } while (category < 0 || category > 3);
 
     if (category == 0)
         return;
 
     clear_screen();
     print("PERTANYAAN DIAGNOSIS\n");
-    print("Jawab berdasarkan keterangan pelanggan.\n\n");
 
     int yes_count = 0;
     bool answer_three = false;
@@ -431,53 +659,30 @@ static void run_diagnosis() {
     if (category == 1) {
         if (ask_yes_no("1. Apakah baterai cepat habis atau perangkat sering mati?"))
             ++yes_count;
-        if (ask_yes_no("2. Apakah persentase baterai berubah tidak wajar?"))
+        if (ask_yes_no("2. Apakah perangkat sulit mengisi daya atau pengisian sering terputus?"))
             ++yes_count;
         answer_three = ask_yes_no("3. Apakah baterai terlihat membengkak atau terasa sangat panas?");
         if (answer_three) ++yes_count;
     } else if (category == 2) {
-        if (ask_yes_no("1. Apakah perangkat tidak mengisi daya dengan aksesori yang biasa dipakai?"))
+        if (ask_yes_no("1. Apakah layar bermasalah (gelap, bergaris, berkedip, atau berubah warna)?"))
             ++yes_count;
-        if (ask_yes_no("2. Apakah pengisian sering tersambung dan terputus?"))
-            ++yes_count;
-        if (ask_yes_no("3. Apakah perangkat tetap tidak mengisi dengan kabel/adaptor lain yang sesuai?"))
-            ++yes_count;
-    } else if (category == 3) {
-        if (ask_yes_no("1. Apakah layar gelap atau tidak menampilkan gambar dengan normal?"))
-            ++yes_count;
-        if (ask_yes_no("2. Apakah muncul garis, kedipan, atau perubahan warna?"))
-            ++yes_count;
-        if (ask_yes_no("3. Apakah masalah tetap muncul setelah perangkat dimulai ulang?"))
-            ++yes_count;
-    } else if (category == 4) {
-        if (ask_yes_no("1. Apakah perangkat terasa lambat saat membuka aplikasi?"))
-            ++yes_count;
-        if (ask_yes_no("2. Apakah ruang penyimpanan hampir penuh?"))
-            ++yes_count;
-        if (ask_yes_no("3. Apakah perangkat tetap lambat setelah dimulai ulang?"))
-            ++yes_count;
-    } else if (category == 5) {
+
         if (device == 1) {
-            if (ask_yes_no("1. Apakah sebagian area layar sentuh tidak merespons?"))
-                ++yes_count;
-            if (ask_yes_no("2. Apakah layar sentuh bergerak atau memilih menu sendiri?"))
-                ++yes_count;
-            if (ask_yes_no("3. Apakah masalah tetap terjadi setelah layar dibersihkan dan perangkat dimulai ulang?"))
+            if (ask_yes_no("2. Apakah layar sentuh tidak merespons atau bergerak sendiri?"))
                 ++yes_count;
         } else {
-            if (ask_yes_no("1. Apakah beberapa tombol keyboard atau touchpad tidak berfungsi?"))
-                ++yes_count;
-            if (ask_yes_no("2. Apakah masalah terjadi juga pada perangkat input lain?"))
-                ++yes_count;
-            if (ask_yes_no("3. Apakah masalah tetap terjadi setelah laptop dimulai ulang?"))
+            if (ask_yes_no("2. Apakah keyboard atau touchpad tidak merespons dengan normal?"))
                 ++yes_count;
         }
+
+        if (ask_yes_no("3. Apakah masalah tetap terjadi setelah perangkat dimulai ulang?"))
+            ++yes_count;
     } else {
-        if (ask_yes_no("1. Apakah perangkat gagal masuk ke sistem operasi?"))
+        if (ask_yes_no("1. Apakah perangkat terasa lambat saat digunakan atau membuka aplikasi?"))
             ++yes_count;
-        if (ask_yes_no("2. Apakah muncul pesan error atau proses boot berhenti?"))
+        if (ask_yes_no("2. Apakah perangkat gagal masuk ke sistem operasi atau menampilkan pesan error?"))
             ++yes_count;
-        if (ask_yes_no("3. Apakah masalah mulai muncul setelah update atau perubahan sistem?"))
+        if (ask_yes_no("3. Apakah ruang penyimpanan hampir penuh atau masalah muncul setelah update?"))
             ++yes_count;
     }
 
@@ -493,6 +698,303 @@ static void show_about() {
     print("untuk membantu teknisi mengelompokkan keluhan HP dan laptop.\n");
 }
 
+
+// ======================================================================
+// Demo penjadwalan CPU preemptive dan sinkronisasi (Nama 2)
+// ======================================================================
+static void u32_to_str(u32 v, char* out) {
+    char tmp[12];
+    int n = 0;
+    if (v == 0) tmp[n++] = '0';
+    while (v > 0) { tmp[n++] = static_cast<char>('0' + v % 10); v /= 10; }
+    int i = 0;
+    while (n > 0) out[i++] = tmp[--n];
+    out[i] = '\0';
+}
+
+static void append(char* dst, const char* src) {
+    while (*dst) ++dst;
+    while (*src) *dst++ = *src++;
+    *dst = '\0';
+}
+
+static void print_uint(u32 v) {
+    char buf[12];
+    u32_to_str(v, buf);
+    print(buf);
+}
+
+// Menunggu n tick berdasarkan jam timer (bukan waktu CPU), jadi tugas pasti
+// terpotong oleh preemption selama menunggu.
+static void busy_wait_ticks(u32 n) {
+    u32 start = sched_ticks();
+    while (sched_ticks() - start < n) { }
+}
+
+static void wait_all_tasks() {
+    while (!sched_all_done(1))
+        task_yield();
+}
+
+// ---- Demo 1: Round Robin ----
+static void rr_body(const char* tag) {
+    for (u32 i = 1; i <= 5; ++i) {
+        busy_wait_ticks(20);                       // 200 ms > quantum 50 ms -> pasti di-preempt
+        char line[64];
+        char num[12];
+        line[0] = '\0';
+        append(line, "  [Tugas ");
+        append(line, tag);
+        append(line, "] iterasi ");
+        u32_to_str(i, num);    append(line, num);
+        append(line, " pada tick ");
+        u32_to_str(sched_ticks(), num);  append(line, num);
+        append(line, "\n");
+        print(line);                               // print() sudah dilindungi console_lock
+    }
+}
+static void rr_task_a() { rr_body("A"); }
+static void rr_task_b() { rr_body("B"); }
+static void rr_task_c() { rr_body("C"); }
+
+static const char* state_name(int s) {
+    switch (s) {
+        case TASK_READY:   return "READY  ";
+        case TASK_RUNNING: return "RUNNING";
+        case TASK_BLOCKED: return "BLOCKED";
+        case TASK_DEAD:    return "SELESAI";
+        default:           return "-      ";
+    }
+}
+
+static void demo_sched() {
+    print("Round Robin: quantum = 5 tick (50 ms), timer 100 Hz.\n");
+    print("Membuat 3 tugas A, B, C...\n");
+    task_create("A", rr_task_a);
+    task_create("B", rr_task_b);
+    task_create("C", rr_task_c);
+    wait_all_tasks();
+
+    print("\n  Tugas   Status   CPU(tick)  Dijadwalkan\n");
+    for (int id = 0; id < MAX_TASKS; ++id) {
+        TaskInfo ti;
+        if (!task_get_info(id, &ti)) continue;
+        char row[64];
+        char num[12];
+        row[0] = '\0';
+        append(row, "  ");
+        append(row, ti.name);
+        int len = 0; while (row[len]) ++len;
+        while (len < 10) { row[len++] = ' '; row[len] = '\0'; }   // kolom nama selebar 8
+        append(row, state_name(ti.state));
+        append(row, "  ");
+        u32_to_str(ti.cpu_ticks, num); append(row, num);
+        int len2 = 0; while (row[len2]) ++len2;
+        while (len2 < 33) { row[len2++] = ' '; row[len2] = '\0'; }
+        u32_to_str(ti.switches, num);  append(row, num);
+        append(row, "\n");
+        print(row);
+    }
+    print("\n");
+}
+
+// ---- Demo 2: race condition vs mutex ----
+static volatile int shared_counter = 0;
+static Mutex race_lock = {0, -1};
+static bool race_use_lock = false;
+static const int RACE_LOOPS = 300;
+
+static void race_body() {
+    for (int i = 0; i < RACE_LOOPS; ++i) {
+        if (race_use_lock) mutex_lock(&race_lock);
+        int tmp = shared_counter;                  // read
+        for (volatile int k = 0; k < 200000; ++k) { }   // "pekerjaan" -> peluang di-preempt
+        shared_counter = tmp + 1;                  // modify-write
+        if (race_use_lock) mutex_unlock(&race_lock);
+    }
+}
+static void race_task_1() { race_body(); }
+static void race_task_2() { race_body(); }
+
+static void demo_race(bool use_lock) {
+    shared_counter = 0;
+    race_use_lock = use_lock;
+    print(use_lock ? "Mode: DENGAN mutex.\n" : "Mode: TANPA kunci.\n");
+    print("2 tugas masing-masing menambah counter 300 kali. Harapan: 600.\n");
+    print("Menjalankan... (tunggu beberapa detik)\n");
+    task_create("R1", race_task_1);
+    task_create("R2", race_task_2);
+    wait_all_tasks();
+    print("Hasil counter = ");
+    print_uint(static_cast<u32>(shared_counter));
+    if (shared_counter == 2 * RACE_LOOPS)
+        print("  -> BENAR (tidak ada update yang hilang)\n\n");
+    else
+        print("  -> SALAH (terjadi race condition, update hilang)\n\n");
+}
+
+// ---- Demo 3: semaphore, produsen-konsumen dengan buffer 3 slot ----
+static int pc_buf[3];
+static int pc_in = 0, pc_out = 0;
+static Semaphore pc_empty, pc_full;
+static Mutex pc_lock = {0, -1};
+
+static void pc_say(const char* who, int item) {
+    char line[48];
+    char num[12];
+    line[0] = '\0';
+    append(line, "  ");
+    append(line, who);
+    u32_to_str(static_cast<u32>(item), num);
+    append(line, num);
+    append(line, "\n");
+    print(line);
+}
+
+static void producer_task() {
+    for (int item = 1; item <= 8; ++item) {
+        sem_wait(&pc_empty);                       // tunggu slot kosong
+        mutex_lock(&pc_lock);
+        pc_buf[pc_in] = item;
+        pc_in = (pc_in + 1) % 3;
+        mutex_unlock(&pc_lock);
+        sem_post(&pc_full);
+        pc_say("Produsen membuat item ", item);
+        busy_wait_ticks(5);
+    }
+}
+
+static void consumer_task() {
+    for (int n = 0; n < 8; ++n) {
+        sem_wait(&pc_full);                        // tunggu ada item
+        mutex_lock(&pc_lock);
+        int item = pc_buf[pc_out];
+        pc_out = (pc_out + 1) % 3;
+        mutex_unlock(&pc_lock);
+        sem_post(&pc_empty);
+        pc_say("                 Konsumen mengambil item ", item);
+        busy_wait_ticks(20);                       // konsumen lebih lambat -> produsen sempat diblok
+    }
+}
+
+static void demo_prodcons() {
+    pc_in = pc_out = 0;
+    sem_init(&pc_empty, 3);
+    sem_init(&pc_full, 0);
+    print("Produsen cepat, konsumen lambat, buffer 3 slot (semaphore).\n");
+    task_create("prod", producer_task);
+    task_create("cons", consumer_task);
+    wait_all_tasks();
+    print("Selesai.\n\n");
+}
+
+// ======================================================================
+// Pengelolaan thread: tampilkan daftar thread dan buat thread latar belakang
+// ======================================================================
+
+// Tambahkan teks lalu isi spasi sampai teks yang ditambahkan selebar `width`.
+static void append_padded(char* dst, const char* src, int width) {
+    while (*dst) ++dst;
+    int n = 0;
+    while (*src) { *dst++ = *src++; ++n; }
+    while (n < width) { *dst++ = ' '; ++n; }
+    *dst = '\0';
+}
+
+static void append_uint_padded(char* dst, u32 v, int width) {
+    char num[12];
+    u32_to_str(v, num);
+    append_padded(dst, num, width);
+}
+
+// Perintah `threads` / `ps`: tabel semua thread beserta statusnya.
+static void show_threads() {
+    u32 now = sched_ticks();
+
+    print("Uptime penjadwal: ");
+    print_uint(now / TIMER_HZ);
+    print(" detik (");
+    print_uint(now);
+    print(" tick), quantum ");
+    print_uint(QUANTUM_TICKS);
+    print(" tick\n\n");
+
+    print("  ID  Nama      Status   CPU (tick)  CPU%  Dijadwalkan\n");
+    print("  --  --------  -------  ----------  ----  -----------\n");
+
+    int shown = 0;
+    for (int id = 0; id < MAX_TASKS; ++id) {
+        TaskInfo ti;
+        if (!task_get_info(id, &ti)) continue;
+
+        u32 pct = (now > 0) ? (ti.cpu_ticks * 100u) / now : 0;
+
+        char row[80];
+        row[0] = '\0';
+        append_padded(row, "", 2);
+        append_uint_padded(row, static_cast<u32>(id), 4);
+        append_padded(row, ti.name, 10);
+        append_padded(row, state_name(ti.state), 9);
+        append_uint_padded(row, ti.cpu_ticks, 12);
+        append_uint_padded(row, pct, 6);
+        append_uint_padded(row, ti.switches, 0);
+        append(row, "\n");
+        print(row);
+        ++shown;
+    }
+
+    print("\nTotal thread terdaftar: ");
+    print_uint(static_cast<u32>(shown));
+    print(" dari ");
+    print_uint(MAX_TASKS);
+    print(" slot. Id 0 = main (shell).\n");
+    print("Status: RUNNING = sedang memakai CPU, READY = menunggu giliran,\n");
+    print("        BLOCKED = menunggu mutex/semaphore, SELESAI = sudah berakhir.\n\n");
+}
+
+// Thread latar belakang: berputar ~10 detik berdasarkan jam timer lalu selesai.
+// Tidak mencetak apa pun supaya tidak mengganggu shell; amati lewat `threads`.
+static void worker_task() {
+    u32 start = sched_ticks();
+    while (sched_ticks() - start < 10 * TIMER_HZ) { }
+}
+
+// Perintah `spawn`: buat satu thread worker.
+static void spawn_worker() {
+    int id = task_create("worker", worker_task);
+    if (id < 0) {
+        print("Gagal membuat thread: semua slot terpakai. Tunggu thread selesai.\n\n");
+        return;
+    }
+    print("Thread 'worker' dibuat dengan id ");
+    print_uint(static_cast<u32>(id));
+    print(". Jalankan 'threads' untuk melihatnya (aktif ~10 detik).\n\n");
+}
+
+// Perintah `kill <id>`: hentikan thread. Pengaman ada di task_kill().
+static void kill_thread(const char* arg) {
+    int id = parse_number(arg);
+    if (id < 0) {
+        print("Penggunaan: kill <id>   (lihat id lewat 'threads')\n\n");
+        return;
+    }
+
+    int result = task_kill(id);
+    if (result == KILL_OK) {
+        print("Thread ");
+        print_uint(static_cast<u32>(id));
+        print(" dihentikan.\n\n");
+    } else if (result == KILL_MAIN) {
+        print("Ditolak: thread main (id 0) adalah shell dan tidak boleh dihentikan.\n\n");
+    } else if (result == KILL_SELF) {
+        print("Ditolak: thread yang sedang berjalan tidak bisa menghentikan dirinya sendiri.\n\n");
+    } else if (result == KILL_HOLDS_LOCK) {
+        print("Ditolak: thread sedang memegang mutex. Coba lagi sebentar lagi.\n\n");
+    } else {
+        print("Thread tidak ditemukan atau sudah selesai.\n\n");
+    }
+}
+
 static void shell() {
     char input[128];
 
@@ -500,7 +1002,7 @@ static void shell() {
     print("Ketik 'help' untuk melihat daftar perintah.\n\n");
 
     while (true) {
-        print("A2OS> ");
+        print(current_is_admin ? "A2OS[ADMIN]> " : "A2OS[USER]> ");
         read_line(input, 128);
 
         if (equals(input, "help")) {
@@ -509,10 +1011,48 @@ static void shell() {
             show_about();
         } else if (equals(input, "diagnosis")) {
             run_diagnosis();
+        } else if (equals(input, "threads") || equals(input, "ps")) {
+            show_threads();
+        } else if (equals(input, "spawn")) {
+            spawn_worker();
+        } else if (equals(input, "kill")) {
+            kill_thread("");
+        } else if (input[0] == 'k' && input[1] == 'i' && input[2] == 'l' &&
+                   input[3] == 'l' && input[4] == ' ') {
+            kill_thread(input + 5);
+        } else if (equals(input, "menu")) {
+            return;                                 // kembali ke main_menu()
+        } else if (equals(input, "sched")) {
+            demo_sched();
+        } else if (equals(input, "race")) {
+            demo_race(false);
+        } else if (equals(input, "race lock")) {
+            demo_race(true);
+        } else if (equals(input, "prodcons")) {
+            demo_prodcons();
+        } else if (equals(input, "ls")) {
+            vfs_list();
+        } else if (equals(input, "create")) {
+            vfs_create();
+        } else if (equals(input, "cat")) {
+            vfs_read();
+        } else if (equals(input, "write")) {
+            vfs_write();
+        } else if (equals(input, "rm")) {
+            vfs_delete();
+        } else if (equals(input, "whoami")) {
+            print(current_is_admin ? "Akun aktif: ADMIN\n\n" : "Akun aktif: USER\n\n");
+        } else if (equals(input, "logout")) {
+            login();
+            clear_screen();
+            print_logo();
+            print("Ketik 'help' untuk melihat perintah.\n\n");
         } else if (equals(input, "clear")) {
             clear_screen();
             print_logo();
             print("Ketik 'help' untuk melihat perintah.\n\n");
+        } else if (equals(input, "echo")) {
+            print("\n");
         } else if (input[0] == 'e' && input[1] == 'c' &&
                 input[2] == 'h' && input[3] == 'o' &&
                 input[4] == ' ') {
@@ -567,11 +1107,12 @@ extern "C" void kernel_main() {
     clear_screen();
     enable_cursor();
 
-    print_logo();
-    print("[ OK ] Kernel A2OS berhasil dimuat.\n");
-    print("[ OK ] Shell internal siap digunakan.\n");
-    print("[ OK ] Asisten diagnosis siap digunakan.\n\n");
+    // Aktifkan IDT, PIC, PIT, dan penjadwal preemptive (tugas utama = id 0).
+    sched_init();
 
+    // Login ditampilkan pertama kali setelah kernel siap.
+    // Menu utama baru dibuka setelah username dan password valid.
+    login();
     main_menu();
 
     for (;;)
