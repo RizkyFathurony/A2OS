@@ -7,6 +7,10 @@ using u32 = unsigned int;
 // ---------- Penjadwal CPU Preemptive (Round Robin) ----------
 enum TaskState : int { TASK_FREE = 0, TASK_READY, TASK_RUNNING, TASK_BLOCKED, TASK_DEAD };
 
+// Jenis objek yang ditunggu thread BLOCKED (dipakai deteksi deadlock).
+enum WaitKind : int { WAIT_NONE = 0, WAIT_OTHER, WAIT_MUTEX };
+
+constexpr int MAX_HELD_MUTEX = 4;     // mutex yang dilacak per thread (untuk pemulihan deadlock)
 constexpr int MAX_TASKS     = 6;
 constexpr int TASK_STACK    = 4096;   // byte per tugas
 constexpr u32 TIMER_HZ      = 100;    // 1 tick = 10 ms
@@ -32,12 +36,21 @@ bool sched_all_done(int first_id);                  // semua tugas id >= first_i
 enum KillResult : int { KILL_OK = 0, KILL_INVALID, KILL_MAIN, KILL_SELF, KILL_HOLDS_LOCK };
 int  task_kill(int id);
 
+// Pemulihan deadlock: hentikan thread DAN lepas paksa semua mutex yang dipegangnya.
+// Tetap menolak thread main (id 0) dan thread yang sedang berjalan.
+int  task_force_kill(int id);
+
 // ---------- Sinkronisasi ----------
 u32  irq_save();                 // matikan interrupt, kembalikan EFLAGS lama
 void irq_restore(u32 flags);
 
 struct Mutex     { volatile int locked; int owner; };
 struct Semaphore { volatile int count; };
+
+// ---------- Deteksi deadlock ----------
+// Membangun wait-for graph (thread -> pemilik mutex yang ditunggunya) dan mencari siklus.
+// Mengisi cycle[] dengan id thread dalam siklus; mengembalikan panjang siklus, 0 jika tidak ada.
+int  sched_find_deadlock(int* cycle, int max);
 
 void mutex_lock(Mutex* m);
 bool mutex_trylock(Mutex* m);
@@ -49,5 +62,7 @@ void sem_post(Semaphore* s);     // V / up
 
 // Dipakai internal oleh sync.cpp
 void task_lock_delta(int delta);       // catat mutex dipegang (+1) / dilepas (-1) oleh tugas sekarang (IF=0)
-void task_block_on(const void* obj);   // tandai tugas sekarang BLOCKED menunggu obj (panggil saat IF=0)
+void task_block_on(const void* obj, int kind = WAIT_OTHER);  // tandai tugas sekarang BLOCKED menunggu obj (panggil saat IF=0)
+void task_held_add(Mutex* m);          // catat mutex yang dipegang tugas sekarang (IF=0)
+void task_held_remove(Mutex* m);       // hapus catatan saat mutex dilepas (IF=0)
 void task_wake_all(const void* obj);   // bangunkan semua tugas yang menunggu obj (panggil saat IF=0)

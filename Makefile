@@ -27,7 +27,7 @@ $(BUILD_DIR)/%.o: kernel/%.cpp kernel/scheduler.h | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 OBJS := $(BUILD_DIR)/boot.o $(BUILD_DIR)/isr.o $(BUILD_DIR)/kernel.o \
-        $(BUILD_DIR)/scheduler.o $(BUILD_DIR)/sync.o
+        $(BUILD_DIR)/scheduler.o $(BUILD_DIR)/sync.o $(BUILD_DIR)/memory.o
 
 $(BUILD_DIR)/kernel.elf: $(OBJS) linker.ld
 	$(LD) $(LDFLAGS) -o $@ $(OBJS)

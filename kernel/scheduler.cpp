@@ -63,6 +63,8 @@ struct Task {
     const char* name;
     const void* waiting;      // objek sinkronisasi yang ditunggu (jika BLOCKED)
     int         held_locks;   // jumlah mutex yang sedang dipegang tugas ini
+    int         wait_kind;    // WAIT_MUTEX jika `waiting` adalah Mutex (untuk deteksi deadlock)
+    Mutex*      held[MAX_HELD_MUTEX];   // mutex yang dipegang (untuk dilepas saat pemulihan)
     u32         cpu_ticks;
     u32         switches;
 };
@@ -157,6 +159,8 @@ int task_create(const char* name, void (*entry)()) {
     tasks[id].name      = name;
     tasks[id].waiting   = nullptr;
     tasks[id].held_locks = 0;
+    tasks[id].wait_kind = WAIT_NONE;
+    for (int k = 0; k < MAX_HELD_MUTEX; ++k) tasks[id].held[k] = nullptr;
     tasks[id].cpu_ticks = 0;
     tasks[id].switches  = 0;
 
@@ -188,16 +192,30 @@ bool sched_all_done(int first_id) {
     return true;
 }
 
-void task_block_on(const void* obj) {
-    tasks[current].state   = TASK_BLOCKED;
-    tasks[current].waiting = obj;
+void task_block_on(const void* obj, int kind) {
+    tasks[current].state     = TASK_BLOCKED;
+    tasks[current].waiting   = obj;
+    tasks[current].wait_kind = kind;
+}
+
+void task_held_add(Mutex* m) {
+    for (int k = 0; k < MAX_HELD_MUTEX; ++k) {
+        if (!tasks[current].held[k]) { tasks[current].held[k] = m; return; }
+    }
+}
+
+void task_held_remove(Mutex* m) {
+    for (int k = 0; k < MAX_HELD_MUTEX; ++k) {
+        if (tasks[current].held[k] == m) { tasks[current].held[k] = nullptr; return; }
+    }
 }
 
 void task_wake_all(const void* obj) {
     for (int i = 0; i < MAX_TASKS; ++i) {
         if (tasks[i].state == TASK_BLOCKED && tasks[i].waiting == obj) {
-            tasks[i].state   = TASK_READY;
-            tasks[i].waiting = nullptr;
+            tasks[i].state     = TASK_READY;
+            tasks[i].waiting   = nullptr;
+            tasks[i].wait_kind = WAIT_NONE;
         }
     }
 }
@@ -229,6 +247,77 @@ int task_kill(int id) {
 
     irq_restore(f);
     return result;
+}
+
+// Paksa hentikan thread dan lepas semua mutex yang dipegangnya, sehingga thread lain
+// yang menunggu mutex itu bisa lanjut. Dipakai untuk memulihkan deadlock.
+int task_force_kill(int id) {
+    u32 f = irq_save();
+    int result;
+
+    if (id == 0) {
+        result = KILL_MAIN;
+    } else if (id < 0 || id >= MAX_TASKS ||
+               tasks[id].state == TASK_FREE || tasks[id].state == TASK_DEAD) {
+        result = KILL_INVALID;
+    } else if (id == current) {
+        result = KILL_SELF;
+    } else {
+        for (int k = 0; k < MAX_HELD_MUTEX; ++k) {
+            Mutex* m = tasks[id].held[k];
+            if (!m) continue;
+            if (m->locked && m->owner == id) {
+                m->locked = 0;
+                m->owner  = -1;
+                task_wake_all(m);               // bangunkan thread yang menunggu mutex ini
+            }
+            tasks[id].held[k] = nullptr;
+        }
+        tasks[id].held_locks = 0;
+        tasks[id].state      = TASK_DEAD;
+        tasks[id].waiting    = nullptr;
+        tasks[id].wait_kind  = WAIT_NONE;
+        result = KILL_OK;
+    }
+
+    irq_restore(f);
+    return result;
+}
+
+// Wait-for graph: setiap thread BLOCKED pada mutex punya tepat satu sisi keluar,
+// yaitu ke thread pemilik mutex itu. Deadlock = ada siklus pada graf tersebut.
+int sched_find_deadlock(int* cycle, int max) {
+    u32 f = irq_save();
+    int found = 0;
+
+    for (int start = 0; start < MAX_TASKS && !found; ++start) {
+        int path[MAX_TASKS + 1];
+        int len = 0;
+        int t = start;
+
+        while (t >= 0 && t < MAX_TASKS && len <= MAX_TASKS) {
+            int pos = -1;
+            for (int k = 0; k < len; ++k) {
+                if (path[k] == t) { pos = k; break; }
+            }
+            if (pos >= 0) {                      // kembali ke thread yang sudah dilewati = siklus
+                int n = len - pos;
+                if (n > max) n = max;
+                for (int k = 0; k < n; ++k) cycle[k] = path[pos + k];
+                found = n;
+                break;
+            }
+            path[len++] = t;
+
+            if (tasks[t].state != TASK_BLOCKED || tasks[t].wait_kind != WAIT_MUTEX)
+                break;                           // thread ini tidak menunggu mutex -> rantai putus
+            const Mutex* m = static_cast<const Mutex*>(tasks[t].waiting);
+            t = m->owner;                        // pindah ke pemilik mutex
+        }
+    }
+
+    irq_restore(f);
+    return found;
 }
 
 void sched_init() {
