@@ -1,4 +1,5 @@
 #include "scheduler.h"
+#include "memory.h"
 
 static volatile u16* const VGA = reinterpret_cast<volatile u16*>(0xB8000);
 static const u8 COLOR = 0x0F;
@@ -551,6 +552,13 @@ static void show_help() {
     print("  rm        - menghapus file\n");
     print("  whoami    - melihat akun aktif\n");
     print("  logout    - keluar dari akun\n");
+    print("  mem       - statistik heap kernel (allocator)\n");
+    print("  memmap    - peta blok heap\n");
+    print("  alloc <n> - kmalloc n byte, memberi id\n");
+    print("  free <id> - kfree alokasi dengan id tersebut\n");
+    print("  memtest   - demo fragmentasi dan coalescing\n");
+    print("  mempolicy - first / best (kebijakan alokasi)\n");
+    print("  deadlock  - demo deadlock (juga: check, recover, order)\n");
     print("  shutdown  - mematikan A2OS \n\n");
 }
 
@@ -995,6 +1003,275 @@ static void kill_thread(const char* arg) {
     }
 }
 
+// ======================================================================
+// Memory allocator (kmalloc/kfree) dan deadlock (deteksi + pemulihan)
+// ======================================================================
+static bool starts_with(const char* s, const char* prefix) {
+    while (*prefix) {
+        if (*s != *prefix) return false;
+        ++s;
+        ++prefix;
+    }
+    return true;
+}
+
+// ---------- Memory allocator ----------
+static void print_stat(const char* label, u32 bytes, u32 blocks) {
+    print(label);
+    print_uint(bytes);
+    print(" byte (");
+    print_uint(blocks);
+    print(" blok)\n");
+}
+
+static void show_mem() {
+    MemStats st;
+    mem_get_stats(&st);
+
+    u32 frag = 0;
+    if (st.free_bytes > 0)
+        frag = 100u - (st.largest_free * 100u) / st.free_bytes;
+
+    print("Heap kernel : ");
+    print_uint(st.total);
+    print(" byte, kebijakan ");
+    print(mem_get_policy() == MEM_BEST_FIT ? "best-fit\n" : "first-fit\n");
+    print_stat("Terpakai    : ", st.used_bytes, st.used_blocks);
+    print_stat("Bebas       : ", st.free_bytes, st.free_blocks);
+    print("Overhead    : ");
+    print_uint(st.overhead);
+    print(" byte (header blok)\n");
+    print("Blok bebas terbesar: ");
+    print_uint(st.largest_free);
+    print(" byte, fragmentasi ");
+    print_uint(frag);
+    print("%\n\n");
+}
+
+static void show_memmap() {
+    print("  No  Offset  Ukuran  Status\n");
+    print("  --  ------  ------  --------\n");
+
+    for (int i = 0; ; ++i) {
+        u32 offset, size;
+        bool is_free;
+        if (!mem_block_info(i, &offset, &size, &is_free))
+            break;
+
+        char row[64];
+        row[0] = '\0';
+        append_padded(row, "", 2);
+        append_uint_padded(row, static_cast<u32>(i), 4);
+        append_uint_padded(row, offset, 8);
+        append_uint_padded(row, size, 8);
+        append(row, is_free ? "BEBAS\n" : "TERPAKAI\n");
+        print(row);
+    }
+    print("\n");
+}
+
+static const int MAX_HANDLES = 16;
+static void* alloc_handles[MAX_HANDLES];
+
+static void alloc_cmd(const char* arg) {
+    int n = parse_number(arg);
+    if (n <= 0) {
+        print("Penggunaan: alloc <ukuran byte>   contoh: alloc 128\n\n");
+        return;
+    }
+
+    int slot = -1;
+    for (int i = 0; i < MAX_HANDLES; ++i) {
+        if (!alloc_handles[i]) { slot = i; break; }
+    }
+    if (slot < 0) {
+        print("Tabel alokasi penuh (16). Bebaskan dulu dengan 'free <id>'.\n\n");
+        return;
+    }
+
+    void* p = kmalloc(static_cast<u32>(n));
+    if (!p) {
+        print("Gagal: tidak ada blok bebas yang cukup besar. Lihat 'mem' dan 'memmap'.\n\n");
+        return;
+    }
+
+    u8* bytes = static_cast<u8*>(p);
+    for (int i = 0; i < n; ++i)
+        bytes[i] = 0xAA;                            // bukti memori hasil alokasi bisa dipakai
+
+    alloc_handles[slot] = p;
+    print("Alokasi id ");
+    print_uint(static_cast<u32>(slot));
+    print(": ");
+    print_uint(static_cast<u32>(n));
+    print(" byte di offset ");
+    print_uint(mem_offset(p));
+    print("\n\n");
+}
+
+static void free_cmd(const char* arg) {
+    int id = parse_number(arg);
+    if (id < 0 || id >= MAX_HANDLES || !alloc_handles[id]) {
+        print("Id alokasi tidak ditemukan. Penggunaan: free <id>\n\n");
+        return;
+    }
+
+    int result = kfree(alloc_handles[id]);
+    alloc_handles[id] = nullptr;
+
+    if (result == MEM_FREE_OK) {
+        print("Alokasi id ");
+        print_uint(static_cast<u32>(id));
+        print(" dibebaskan.\n\n");
+    } else {
+        print("Gagal membebaskan: blok tidak valid.\n\n");
+    }
+}
+
+static void policy_cmd(const char* arg) {
+    if (equals(arg, "first")) {
+        mem_set_policy(MEM_FIRST_FIT);
+        print("Kebijakan alokasi: first-fit.\n\n");
+    } else if (equals(arg, "best")) {
+        mem_set_policy(MEM_BEST_FIT);
+        print("Kebijakan alokasi: best-fit.\n\n");
+    } else {
+        print("Penggunaan: mempolicy first | mempolicy best\n\n");
+    }
+}
+
+// Demo: fragmentasi lalu coalescing.
+static void demo_memtest() {
+    static const u32 sizes[6] = { 512, 1024, 512, 1024, 512, 1024 };
+    void* p[6];
+
+    print("Demo fragmentasi dan coalescing.\n");
+    print("1) Alokasi 6 blok: 512, 1024, 512, 1024, 512, 1024 byte.\n");
+    for (int i = 0; i < 6; ++i)
+        p[i] = kmalloc(sizes[i]);
+
+    print("2) Bebaskan blok 1 dan 3 (tidak bersebelahan) -> terbentuk 2 lubang.\n");
+    kfree(p[1]);
+    kfree(p[3]);
+    show_memmap();
+
+    print("3) Bebaskan blok 2 -> lubang bertetangga digabung (coalescing).\n");
+    kfree(p[2]);
+    show_memmap();
+
+    print("4) Bebaskan sisanya -> heap kembali menjadi satu blok bebas.\n");
+    kfree(p[0]);
+    kfree(p[4]);
+    kfree(p[5]);
+    show_mem();
+}
+
+// ---------- Deadlock ----------
+static Mutex dl_a = {0, -1};
+static Mutex dl_b = {0, -1};
+static bool dl_ordered = false;
+
+static void dl_body(Mutex* first, Mutex* second) {
+    mutex_lock(first);
+    busy_wait_ticks(20);            // beri waktu thread lain mengunci mutex pertamanya
+    mutex_lock(second);
+    busy_wait_ticks(5);
+    mutex_unlock(second);
+    mutex_unlock(first);
+}
+
+static void dl_task_1() { dl_body(&dl_a, &dl_b); }
+static void dl_task_2() {
+    if (dl_ordered) dl_body(&dl_a, &dl_b);   // pencegahan: urutan kunci sama (A lalu B)
+    else            dl_body(&dl_b, &dl_a);   // penyebab: urutan terbalik (B lalu A)
+}
+
+static void print_task_ref(int id) {
+    TaskInfo ti;
+    if (task_get_info(id, &ti))
+        print(ti.name);
+    print("(id ");
+    print_uint(static_cast<u32>(id));
+    print(")");
+}
+
+static void report_deadlock() {
+    int cycle[MAX_TASKS];
+    int n = sched_find_deadlock(cycle, MAX_TASKS);
+
+    if (n == 0) {
+        print("Tidak ada deadlock terdeteksi.\n\n");
+        return;
+    }
+
+    print_colored("DEADLOCK TERDETEKSI!\n", COLOR_RED);
+    print("Siklus tunggu: ");
+    for (int i = 0; i <= n; ++i) {
+        print_task_ref(cycle[i % n]);
+        if (i < n) print(" -> ");
+    }
+    print("\n");
+    print("Tiap thread menunggu mutex yang dipegang thread berikutnya, jadi tidak ada yang bisa maju.\n");
+    print("Jalankan 'threads' untuk melihat status BLOCKED, lalu 'deadlock recover'.\n\n");
+}
+
+// Pemulihan: pilih korban (id terbesar = thread termuda), hentikan, lepas semua mutex-nya.
+static void recover_deadlock() {
+    int cycle[MAX_TASKS];
+    int n = sched_find_deadlock(cycle, MAX_TASKS);
+
+    if (n == 0) {
+        print("Tidak ada deadlock untuk dipulihkan.\n\n");
+        return;
+    }
+
+    int victim = cycle[0];
+    for (int i = 1; i < n; ++i)
+        if (cycle[i] > victim) victim = cycle[i];
+
+    print("Korban dipilih: ");
+    print_task_ref(victim);
+    print("\n");
+
+    int result = task_force_kill(victim);
+    if (result == KILL_OK) {
+        print_colored("Pulih.", COLOR_GREEN);
+        print(" Korban dihentikan dan semua mutex miliknya dilepas.\n");
+        print("Thread lain kini bisa melanjutkan. Jalankan 'threads' untuk melihat hasilnya.\n\n");
+    } else {
+        print("Gagal memulihkan: korban tidak boleh dihentikan (thread main atau sedang berjalan).\n\n");
+    }
+}
+
+static void demo_deadlock(bool ordered) {
+    if (!sched_all_done(1)) {
+        print("Masih ada thread aktif atau terblokir. Selesaikan dulu ('threads', 'kill <id>', 'deadlock recover').\n\n");
+        return;
+    }
+
+    dl_a.locked = 0; dl_a.owner = -1;
+    dl_b.locked = 0; dl_b.owner = -1;
+    dl_ordered = ordered;
+
+    if (ordered)
+        print("Mode: PENCEGAHAN. D1 dan D2 sama-sama mengunci A lalu B (urutan kunci seragam).\n");
+    else
+        print("Mode: PENYEBAB. D1 mengunci A lalu B, D2 mengunci B lalu A.\n");
+    print("Menjalankan... (maks. 3 detik)\n");
+
+    task_create("D1", dl_task_1);
+    task_create("D2", dl_task_2);
+
+    u32 start = sched_ticks();
+    while (!sched_all_done(1) && sched_ticks() - start < 3 * TIMER_HZ)
+        task_yield();
+
+    if (sched_all_done(1))
+        print("Kedua thread selesai tanpa deadlock.\n\n");
+    else
+        report_deadlock();
+}
+
 static void shell() {
     char input[128];
 
@@ -1030,6 +1307,32 @@ static void shell() {
             demo_race(true);
         } else if (equals(input, "prodcons")) {
             demo_prodcons();
+        } else if (equals(input, "mem")) {
+            show_mem();
+        } else if (equals(input, "memmap")) {
+            show_memmap();
+        } else if (equals(input, "memtest")) {
+            demo_memtest();
+        } else if (equals(input, "mempolicy")) {
+            policy_cmd("");
+        } else if (starts_with(input, "mempolicy ")) {
+            policy_cmd(input + 10);
+        } else if (equals(input, "alloc")) {
+            alloc_cmd("");
+        } else if (starts_with(input, "alloc ")) {
+            alloc_cmd(input + 6);
+        } else if (equals(input, "free")) {
+            free_cmd("");
+        } else if (starts_with(input, "free ")) {
+            free_cmd(input + 5);
+        } else if (equals(input, "deadlock")) {
+            demo_deadlock(false);
+        } else if (equals(input, "deadlock order")) {
+            demo_deadlock(true);
+        } else if (equals(input, "deadlock check")) {
+            report_deadlock();
+        } else if (equals(input, "deadlock recover")) {
+            recover_deadlock();
         } else if (equals(input, "ls")) {
             vfs_list();
         } else if (equals(input, "create")) {
@@ -1108,6 +1411,7 @@ extern "C" void kernel_main() {
     enable_cursor();
 
     // Aktifkan IDT, PIC, PIT, dan penjadwal preemptive (tugas utama = id 0).
+    mem_init();            // siapkan heap kernel (kmalloc/kfree)
     sched_init();
 
     // Login ditampilkan pertama kali setelah kernel siap.

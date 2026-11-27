@@ -9,7 +9,7 @@
 bool mutex_trylock(Mutex* m) {
     u32 f = irq_save();
     bool ok = (m->locked == 0);
-    if (ok) { m->locked = 1; m->owner = task_current(); task_lock_delta(1); }
+    if (ok) { m->locked = 1; m->owner = task_current(); task_lock_delta(1); task_held_add(m); }
     irq_restore(f);
     return ok;
 }
@@ -21,10 +21,11 @@ void mutex_lock(Mutex* m) {
             m->locked = 1;
             m->owner  = task_current();
             task_lock_delta(1);
+            task_held_add(m);
             irq_restore(f);
             return;
         }
-        task_block_on(m);                   // masuk antrean tunggu mutex
+        task_block_on(m, WAIT_MUTEX);       // masuk antrean tunggu mutex (tercatat untuk deteksi deadlock)
         irq_restore(f);
         task_yield();                       // serahkan CPU, coba lagi saat dibangunkan
     }
@@ -36,6 +37,7 @@ void mutex_unlock(Mutex* m) {
         m->locked = 0;
         m->owner  = -1;
         task_lock_delta(-1);
+        task_held_remove(m);
         task_wake_all(m);
     }
     irq_restore(f);
