@@ -2,6 +2,13 @@
 
 static volatile u16* const VGA = reinterpret_cast<volatile u16*>(0xB8000);
 static const u8 COLOR = 0x0F;
+
+static const u8 COLOR_GREEN  = 0x0A;  // hijau terang
+static const u8 COLOR_YELLOW = 0x0E;  // kuning
+static const u8 COLOR_RED    = 0x0C;  // merah terang
+
+static u8 text_color = COLOR;         // warna teks yang sedang aktif
+
 static int cursor_x = 0;
 static int cursor_y = 0;
 
@@ -102,7 +109,7 @@ static void put_char(char c) {
             scroll_screen();
 
         VGA[cursor_y * 80 + cursor_x] =
-            (static_cast<u16>(COLOR) << 8) | static_cast<u8>(c);
+            (static_cast<u16>(text_color) << 8) | static_cast<u8>(c);
         ++cursor_x;
     }
 
@@ -120,6 +127,49 @@ static void print(const char* s) {
     while (*s)
         put_char(*s++);
     mutex_unlock(&console_lock);
+}
+
+// Cetak teks dengan warna tertentu, lalu kembalikan warna semula.
+// Warna diubah di dalam console_lock agar tidak bocor ke tugas lain.
+static void print_colored(const char* s, u8 color) {
+    mutex_lock(&console_lock);
+    u8 old = text_color;
+    text_color = color;
+    while (*s)
+        put_char(*s++);
+    text_color = old;
+    mutex_unlock(&console_lock);
+}
+
+// Tingkat kendala hasil diagnosis.
+enum Severity { RINGAN, SEDANG, BERAT };
+
+// Menentukan tingkat kendala dari kategori dan jumlah jawaban "ya".
+static Severity determine_severity(int category, int yes_count, bool answer_three) {
+    // Baterai membengkak/sangat panas berbahaya, langsung dianggap berat.
+    if (category == 1 && answer_three)
+        return BERAT;
+
+    if (yes_count >= 3)
+        return BERAT;
+    if (yes_count == 2)
+        return SEDANG;
+    return RINGAN;
+}
+
+static void print_severity(Severity level) {
+    print("Tingkat   : ");
+
+    if (level == BERAT) {
+        print_colored("BERAT (merah)\n", COLOR_RED);
+        print("            Segera bawa ke teknisi untuk pemeriksaan.\n");
+    } else if (level == SEDANG) {
+        print_colored("SEDANG (kuning)\n", COLOR_YELLOW);
+        print("            Sebaiknya diperiksa dalam waktu dekat.\n");
+    } else {
+        print_colored("RINGAN (hijau)\n", COLOR_GREEN);
+        print("            Coba penanganan dasar terlebih dahulu.\n");
+    }
 }
 
 static bool equals(const char* a, const char* b) {
@@ -522,6 +572,8 @@ static void show_diagnosis_result(int device, int category, int yes_count, bool 
         print("Perangkat : Handphone\n");
     else
         print("Perangkat : Laptop\n");
+
+    print_severity(determine_severity(category, yes_count, answer_three));
 
     if (category == 1) {
         print("Kategori  : Baterai / pengisian daya\n");
